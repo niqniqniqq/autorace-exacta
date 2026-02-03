@@ -126,11 +126,12 @@ def upsert_snapshot(
     content_type: str,
     storage_uri: str,
 ) -> RawSnapshot:
+    # Skip if identical content already stored for the same source+url
     existing = db.scalar(
         select(RawSnapshot).where(
             RawSnapshot.source == source,
             RawSnapshot.url == url,
-            RawSnapshot.fetched_at == fetched_at,
+            RawSnapshot.content_hash == content_hash,
         )
     )
     if existing:
