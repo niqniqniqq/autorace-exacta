@@ -6,7 +6,7 @@ import gzip
 import hashlib
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.config import get_settings
@@ -28,7 +28,7 @@ def save_snapshot(
 ) -> tuple[str, str]:
     """Save content to gzipped file. Returns (storage_uri, content_hash)."""
     sha = hashlib.sha256(content).hexdigest()
-    ts = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     directory = _snapshot_dir(source, track_code, date_str)
     directory.mkdir(parents=True, exist_ok=True)
 

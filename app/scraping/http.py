@@ -16,7 +16,8 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://autorace.jp"
-INIT_PATH = "/race_info/Live/kawaguchi"
+DEFAULT_INIT_TRACK = "kawaguchi"
+INIT_PATH_TEMPLATE = "/race_info/Live/{track_code}"
 
 PLACE_CODES: dict[str, int] = {
     "kawaguchi": 2,
@@ -25,12 +26,23 @@ PLACE_CODES: dict[str, int] = {
     "iizuka": 5,
     "sanyou": 6,
 }
+NIGHT_SUFFIX = "2"
+
+
+def resolve_place_code(track_code: str) -> int:
+    if track_code in PLACE_CODES:
+        return PLACE_CODES[track_code]
+    if track_code.endswith(NIGHT_SUFFIX):
+        base = track_code[: -len(NIGHT_SUFFIX)]
+        if base in PLACE_CODES:
+            return PLACE_CODES[base]
+    raise KeyError(f"Unsupported track_code: {track_code}")
 
 
 class AutoraceClient:
     """Session-based client with CSRF token management and polite rate limiting."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, init_track_code: str | None = None) -> None:
         cfg = get_settings()
         self._session = requests.Session()
         self._session.headers.update(
@@ -39,6 +51,7 @@ class AutoraceClient:
                 "Accept": "application/json, text/html, */*",
             }
         )
+        self._init_track_code = init_track_code or DEFAULT_INIT_TRACK
         self._delay_min = cfg.request_delay_min
         self._delay_max = cfg.request_delay_max
         self._csrf_token: str | None = None
@@ -51,7 +64,8 @@ class AutoraceClient:
         if self._csrf_token:
             return self._csrf_token
         self._wait()
-        resp = self._session.get(f"{BASE_URL}{INIT_PATH}", timeout=30)
+        init_path = INIT_PATH_TEMPLATE.format(track_code=self._init_track_code)
+        resp = self._session.get(f"{BASE_URL}{init_path}", timeout=30)
         resp.raise_for_status()
         match = re.search(r'<meta name="csrf-token" content="([^"]+)"', resp.text)
         if not match:

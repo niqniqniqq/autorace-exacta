@@ -56,7 +56,7 @@ def resolve_date_with_reason(
     if not is_date_keyword(date_str):
         return date.fromisoformat(date_str), None
 
-    probe_client = client or AutoraceClient()
+    probe_client = client or AutoraceClient(init_track_code=track)
     today = _today()
 
     if date_str == "today":

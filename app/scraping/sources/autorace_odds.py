@@ -6,7 +6,7 @@ import logging
 from datetime import date
 from typing import Any
 
-from app.scraping.http import PLACE_CODES, AutoraceClient
+from app.scraping.http import AutoraceClient, resolve_place_code
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ def fetch_odds(
     client: AutoraceClient, track_code: str, race_date: date, race_no: int
 ) -> dict[str, Any]:
     """Fetch odds for a single race. Returns raw API body."""
-    place_code = PLACE_CODES[track_code]
+    place_code = resolve_place_code(track_code)
     payload = {
         "placeCode": place_code,
         "raceDate": race_date.isoformat(),
@@ -47,7 +47,12 @@ def fetch_all_odds(
             body = data.get("body") or {}
             rtw = body.get("rtwOddsList") or {}
             if not rtw:
-                logger.info("No exacta odds for R%d — skipping.", race_no)
+                logger.info(
+                    "No exacta odds for %s %s R%d — skipping.",
+                    track_code,
+                    race_date,
+                    race_no,
+                )
                 continue
             results.append((race_no, data))
             logger.info("Fetched odds: %s %s R%d", track_code, race_date, race_no)
