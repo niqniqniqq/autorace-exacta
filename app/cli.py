@@ -75,10 +75,11 @@ def fetch_program(
         upsert_track,
     )
 
-    from app.services.date_resolver import resolve_date_with_reason
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
 
+    client = AutoraceClient() if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
-        track, dt, mode="fetch:program", lookback_days=lookback_days
+        track, dt, mode="fetch:program", lookback_days=lookback_days, client=client
     )
     if race_date is None:
         if skip_if_no_meet:
@@ -88,7 +89,8 @@ def fetch_program(
         raise typer.Exit(code=1)
 
     dt = race_date.isoformat()
-    client = AutoraceClient()
+    if client is None:
+        client = AutoraceClient()
     programs = fetch_all_programs(client, track, race_date)
 
     with get_db() as db:
@@ -146,11 +148,12 @@ def fetch_odds_cmd(
         upsert_track,
     )
 
-    from app.services.date_resolver import resolve_date_with_reason
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
     from app.services.odds_freshness import has_fresh_odds
 
+    client = AutoraceClient() if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
-        track, dt, mode="fetch:odds", lookback_days=lookback_days
+        track, dt, mode="fetch:odds", lookback_days=lookback_days, client=client
     )
     if race_date is None:
         if skip_if_no_meet:
@@ -170,7 +173,8 @@ def fetch_odds_cmd(
             )
             return
 
-    client = AutoraceClient()
+    if client is None:
+        client = AutoraceClient()
     odds_data = fetch_all_odds(client, track, race_date, race_nos=race_nos)
 
     captured_at = datetime.now(UTC)
@@ -228,10 +232,11 @@ def fetch_results_cmd(
         upsert_track,
     )
 
-    from app.services.date_resolver import resolve_date_with_reason
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
 
+    client = AutoraceClient() if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
-        track, dt, mode="fetch:results", lookback_days=lookback_days
+        track, dt, mode="fetch:results", lookback_days=lookback_days, client=client
     )
     if race_date is None:
         if skip_if_no_meet:
@@ -241,7 +246,8 @@ def fetch_results_cmd(
         raise typer.Exit(code=1)
 
     dt = race_date.isoformat()
-    client = AutoraceClient()
+    if client is None:
+        client = AutoraceClient()
     race_nos = [race_no] if race_no else None
     results_data = fetch_all_results(client, track, race_date, race_nos=race_nos)
 
@@ -357,14 +363,16 @@ def predict_exacta(
 
     from app.db.models import OddsExacta, Race, RaceDay
     from app.db.session import get_db
+    from app.scraping.http import AutoraceClient
     from app.services.features import get_race_features
     from app.services.modeling import ExactaModel
     from app.services.upsert import upsert_prediction_exacta, upsert_race_day, upsert_track
 
-    from app.services.date_resolver import resolve_date_with_reason
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
 
+    client = AutoraceClient() if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
-        track, dt, mode="predict:exacta", lookback_days=lookback_days
+        track, dt, mode="predict:exacta", lookback_days=lookback_days, client=client
     )
     if race_date is None:
         if skip_if_no_meet:

@@ -11,7 +11,7 @@ from app.scraping.sources.autorace_program import fetch_program
 
 logger = logging.getLogger(__name__)
 
-_DATE_KEYWORDS = {"auto", "latest", "today"}
+DATE_KEYWORDS = {"auto", "latest", "today"}
 
 
 def _today() -> date:
@@ -40,6 +40,10 @@ def _probe_meet_day(client: AutoraceClient, track: str, race_date: date) -> bool
     return False
 
 
+def is_date_keyword(date_str: str) -> bool:
+    return date_str in DATE_KEYWORDS
+
+
 def resolve_date_with_reason(
     track: str,
     date_str: str,
@@ -49,7 +53,7 @@ def resolve_date_with_reason(
     client: AutoraceClient | None = None,
 ) -> tuple[date | None, str | None]:
     """Resolve race date; return (date, reason) where reason is for None cases."""
-    if date_str not in _DATE_KEYWORDS:
+    if not is_date_keyword(date_str):
         return date.fromisoformat(date_str), None
 
     probe_client = client or AutoraceClient()
