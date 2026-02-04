@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import typer
@@ -19,7 +19,11 @@ logging.basicConfig(
 app = typer.Typer(help="autorace-exacta CLI")
 logger = logging.getLogger(__name__)
 
-TRACK_NAMES = {"kawaguchi": "川口"}
+TRACK_NAMES = {
+    "kawaguchi": "川口",
+    "kawaguchi2": "川口ナイト",
+    "isesaki2": "伊勢崎ナイト",
+}
 
 
 # ---------------------------------------------------------------
@@ -77,7 +81,7 @@ def fetch_program(
 
     from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
 
-    client = AutoraceClient() if is_date_keyword(dt) else None
+    client = AutoraceClient(init_track_code=track) if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
         track, dt, mode="fetch:program", lookback_days=lookback_days, client=client
     )
@@ -90,7 +94,7 @@ def fetch_program(
 
     dt = race_date.isoformat()
     if client is None:
-        client = AutoraceClient()
+        client = AutoraceClient(init_track_code=track)
     programs = fetch_all_programs(client, track, race_date)
 
     with get_db() as db:
@@ -104,7 +108,7 @@ def fetch_program(
                 db,
                 source="program",
                 url=f"autorace.jp/program/{track}/{dt}/R{race_no_idx}",
-                fetched_at=datetime.now(UTC),
+                fetched_at=datetime.now(timezone.utc),
                 http_status=200,
                 content_hash=chash,
                 content_type="application/json",
@@ -139,10 +143,10 @@ def fetch_odds_cmd(
     from app.scraping.http import AutoraceClient
     from app.scraping.parsers.odds_parser import parse_exacta_odds
     from app.scraping.sources.autorace_odds import fetch_all_odds
+    from app.services.guards import guard_odds_race
     from app.services.storage import save_json_snapshot
     from app.services.upsert import (
         upsert_odds_exacta,
-        upsert_race,
         upsert_race_day,
         upsert_snapshot,
         upsert_track,
@@ -151,7 +155,7 @@ def fetch_odds_cmd(
     from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
     from app.services.odds_freshness import has_fresh_odds
 
-    client = AutoraceClient() if is_date_keyword(dt) else None
+    client = AutoraceClient(init_track_code=track) if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
         track, dt, mode="fetch:odds", lookback_days=lookback_days, client=client
     )
@@ -174,10 +178,10 @@ def fetch_odds_cmd(
             return
 
     if client is None:
-        client = AutoraceClient()
+        client = AutoraceClient(init_track_code=track)
     odds_data = fetch_all_odds(client, track, race_date, race_nos=race_nos)
 
-    captured_at = datetime.now(UTC)
+    captured_at = datetime.now(timezone.utc)
 
     with get_db() as db:
         t = upsert_track(db, track, TRACK_NAMES.get(track, track))
@@ -185,6 +189,17 @@ def fetch_odds_cmd(
 
         total_odds = 0
         for rno, data in odds_data:
+            guard = guard_odds_race(db, race_day_id=rd.race_day_id, race_no=rno)
+            if guard.race is None:
+                logger.warning(
+                    "Skip odds save (guard:%s entries=%d) track=%s date=%s R%d",
+                    guard.reason,
+                    guard.entries_count,
+                    track,
+                    dt,
+                    rno,
+                )
+                continue
             storage_uri, chash = save_json_snapshot("odds", track, dt, data)
             upsert_snapshot(
                 db,
@@ -196,9 +211,10 @@ def fetch_odds_cmd(
                 content_type="application/json",
                 storage_uri=storage_uri,
             )
-            race = upsert_race(db, rd.race_day_id, rno)
             odds_list = parse_exacta_odds(data)
-            cnt = upsert_odds_exacta(db, race.race_id, odds_list, captured_at)
+            cnt = upsert_odds_exacta(
+                db, guard.race.race_id, odds_list, captured_at
+            )
             total_odds += cnt
 
         typer.echo(f"Fetched odds for {len(odds_data)} races, {total_odds} new entries")
@@ -234,7 +250,7 @@ def fetch_results_cmd(
 
     from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
 
-    client = AutoraceClient() if is_date_keyword(dt) else None
+    client = AutoraceClient(init_track_code=track) if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
         track, dt, mode="fetch:results", lookback_days=lookback_days, client=client
     )
@@ -247,7 +263,7 @@ def fetch_results_cmd(
 
     dt = race_date.isoformat()
     if client is None:
-        client = AutoraceClient()
+        client = AutoraceClient(init_track_code=track)
     race_nos = [race_no] if race_no else None
     results_data = fetch_all_results(client, track, race_date, race_nos=race_nos)
 
@@ -261,7 +277,7 @@ def fetch_results_cmd(
                 db,
                 source="results",
                 url=f"autorace.jp/results/{track}/{dt}/R{rno}",
-                fetched_at=datetime.now(UTC),
+                fetched_at=datetime.now(timezone.utc),
                 http_status=200,
                 content_hash=chash,
                 content_type="application/json",
@@ -330,7 +346,7 @@ def train_model(
             model_version=version,
             train_from=date.fromisoformat(from_date),
             train_to=date.fromisoformat(to_date),
-            created_at=datetime.now(UTC),
+            created_at=datetime.now(timezone.utc),
             logloss=logloss,
             brier=brier,
             n_races=len(meta),
@@ -364,13 +380,14 @@ def predict_exacta(
     from app.db.models import OddsExacta, Race, RaceDay
     from app.db.session import get_db
     from app.scraping.http import AutoraceClient
+    from app.services.guards import guard_predict_race
     from app.services.features import get_race_features
     from app.services.modeling import ExactaModel
     from app.services.upsert import upsert_prediction_exacta, upsert_race_day, upsert_track
 
     from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
 
-    client = AutoraceClient() if is_date_keyword(dt) else None
+    client = AutoraceClient(init_track_code=track) if is_date_keyword(dt) else None
     race_date, reason = resolve_date_with_reason(
         track, dt, mode="predict:exacta", lookback_days=lookback_days, client=client
     )
@@ -383,7 +400,7 @@ def predict_exacta(
 
     dt = race_date.isoformat()
     model = ExactaModel.load(model_path)
-    predicted_at = datetime.now(UTC)
+    predicted_at = datetime.now(timezone.utc)
 
     with get_db() as db:
         t = upsert_track(db, track, TRACK_NAMES.get(track, track))
@@ -400,6 +417,19 @@ def predict_exacta(
         )
 
         for race in races:
+            guard = guard_predict_race(db, race_id=race.race_id)
+            if not guard.ok:
+                logger.warning(
+                    "Skip predict (guard:%s entries=%d odds=%d/%d) track=%s date=%s R%d",
+                    guard.reason,
+                    guard.entries_count,
+                    guard.odds_count,
+                    guard.required_odds,
+                    track,
+                    dt,
+                    race.race_no,
+                )
+                continue
             car_nos, feats = get_race_features(db, race.race_id)
             if len(car_nos) < 2:
                 continue

@@ -6,7 +6,7 @@ import logging
 from datetime import date
 from typing import Any
 
-from app.scraping.http import PLACE_CODES, AutoraceClient
+from app.scraping.http import AutoraceClient, resolve_place_code
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ def fetch_program(
     client: AutoraceClient, track_code: str, race_date: date, race_no: int
 ) -> dict[str, Any]:
     """Fetch program for a single race. Returns the raw API body."""
-    place_code = PLACE_CODES[track_code]
+    place_code = resolve_place_code(track_code)
     payload = {
         "placeCode": place_code,
         "raceDate": race_date.isoformat(),
@@ -40,7 +40,9 @@ def fetch_all_programs(
             body = data.get("body") or {}
             player_list = body.get("playerList") or []
             if not player_list:
-                logger.info("No players for %s R%d — stopping.", race_date, race_no)
+                logger.info(
+                    "No players for %s %s R%d — stopping.", track_code, race_date, race_no
+                )
                 break
             results.append(data)
             logger.info(
