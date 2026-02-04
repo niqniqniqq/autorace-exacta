@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -194,7 +194,7 @@ def upsert_result(
 
     rr = RaceResult(
         race_id=race_id,
-        decided_at=datetime.now(UTC),
+        decided_at=datetime.now(timezone.utc),
         winner_car_no=result.order[0] if len(result.order) > 0 else None,
         second_car_no=result.order[1] if len(result.order) > 1 else None,
         third_car_no=result.order[2] if len(result.order) > 2 else None,
@@ -223,7 +223,7 @@ def upsert_payout_exacta(
         second_car_no=payout.second_car_no,
         payout_yen=payout.payout_yen,
         popularity_rank=payout.popularity_rank,
-        decided_at=datetime.now(UTC),
+        decided_at=datetime.now(timezone.utc),
     )
     db.add(pe)
     db.flush()

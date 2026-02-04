@@ -2,6 +2,8 @@
 
 オートレース 2連単（Exacta）確率予測 MVP。川口オートレースの公開データを収集し、Plackett-Luce モデルで2連単の確率を算出する。
 
+**kawaguchi と kawaguchi2（ナイト）は別 track として DB 上も完全に分離されます。**
+
 ## 前提条件
 
 - Docker & Docker Compose
@@ -88,6 +90,27 @@ curl http://localhost:8000/health
 */5 * * * * cd /app && python -m app.cli fetch:odds --track kawaguchi --date today --skip-if-no-meet
 */5 * * * * cd /app && python -m app.cli predict:exacta --track kawaguchi --date today --skip-if-no-meet --model models/model.pkl --model-version v0
 ```
+
+## ナイトレース (kawaguchi2) の運用例
+
+```bash
+TRACK=kawaguchi2
+
+docker compose run --rm worker python -m app.cli fetch:program \
+  --track $TRACK --date 2026-02-04 --skip-if-no-meet
+
+docker compose run --rm worker python -m app.cli fetch:odds \
+  --track $TRACK --date 2026-02-04 --skip-if-no-meet
+
+docker compose run --rm worker python -m app.cli fetch:results \
+  --track $TRACK --date 2026-02-04 --skip-if-no-meet
+
+docker compose run --rm worker python -m app.cli predict:exacta \
+  --track $TRACK --date 2026-02-04 --skip-if-no-meet \
+  --model models/model.pkl --model-version v0
+```
+
+> **注意:** `fetch:program` / `fetch:odds` / `fetch:results` / `predict:exacta` は同一 track を揃えて実行してください。kawaguchi と kawaguchi2 は別 track として DB 上も完全に分離されます。
 
 ## テスト
 

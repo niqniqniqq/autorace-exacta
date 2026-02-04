@@ -32,3 +32,25 @@ def test_resolve_date_auto_lookback(monkeypatch):
         "kawaguchi", "auto", mode="fetch:odds", lookback_days=5
     )
     assert resolved == today - timedelta(days=2)
+
+
+def test_resolve_date_passes_track_to_probe(monkeypatch):
+    today = date(2026, 2, 1)
+    seen = {}
+
+    monkeypatch.setattr(date_resolver, "_today", lambda: today)
+
+    def fake_probe(client, track, race_date):
+        seen["track"] = track
+        seen["date"] = race_date
+        return True
+
+    monkeypatch.setattr(date_resolver, "_probe_meet_day", fake_probe)
+
+    resolved, _ = date_resolver.resolve_date_with_reason(
+        "kawaguchi2", "today", mode="fetch:program"
+    )
+
+    assert resolved == today
+    assert seen["track"] == "kawaguchi2"
+    assert seen["date"] == today
