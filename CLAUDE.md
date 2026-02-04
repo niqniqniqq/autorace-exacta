@@ -29,6 +29,12 @@ alembic upgrade head                   # マイグレーション
 - POST /race_info/RaceResult — 結果 (要CSRF)
 - placeCode: kawaguchi=2, isesaki=3, hamamatsu=4, iizuka=5, sanyou=6
 
+## CLI日付解決
+- `--date` は `YYYY-MM-DD` / `auto` / `latest` / `today` を受け付ける
+- 日付解決ロジックは app/services/date_resolver.py に集約
+- オッズ鮮度チェックは app/services/odds_freshness.py (デフォルト3分)
+- cron運用時は `--skip-if-no-meet` でexit 0スキップ
+
 ## 重要な制約
 - 公開ページのみ使用。ログイン・課金壁の回避禁止
 - 低負荷: 1-3秒ジッタ、指数バックオフ、User-Agent明示
