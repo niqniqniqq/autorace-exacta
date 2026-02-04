@@ -17,6 +17,7 @@ logging.basicConfig(
 )
 
 app = typer.Typer(help="autorace-exacta CLI")
+logger = logging.getLogger(__name__)
 
 TRACK_NAMES = {"kawaguchi": "川口"}
 
@@ -54,7 +55,11 @@ def sync_race_days(
 @app.command("fetch:program")
 def fetch_program(
     track: str = typer.Option(..., help="Track code"),
-    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD"),
+    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD | auto | latest | today"),
+    lookback_days: int = typer.Option(14, help="Lookback days for auto/latest"),
+    skip_if_no_meet: bool = typer.Option(
+        True, "--skip-if-no-meet/--no-skip-if-no-meet", help="Skip if no meet"
+    ),
 ) -> None:
     """Fetch and store program (出走表) for all races of the day."""
     from app.db.session import get_db
@@ -70,8 +75,22 @@ def fetch_program(
         upsert_track,
     )
 
-    race_date = date.fromisoformat(dt)
-    client = AutoraceClient()
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
+
+    client = AutoraceClient() if is_date_keyword(dt) else None
+    race_date, reason = resolve_date_with_reason(
+        track, dt, mode="fetch:program", lookback_days=lookback_days, client=client
+    )
+    if race_date is None:
+        if skip_if_no_meet:
+            reason_text = "開催なし" if reason == "no_meet" else "解決失敗"
+            logger.info("Skip fetch:program (%s) track=%s date=%s", reason_text, track, dt)
+            return
+        raise typer.Exit(code=1)
+
+    dt = race_date.isoformat()
+    if client is None:
+        client = AutoraceClient()
     programs = fetch_all_programs(client, track, race_date)
 
     with get_db() as db:
@@ -108,8 +127,12 @@ def fetch_program(
 @app.command("fetch:odds")
 def fetch_odds_cmd(
     track: str = typer.Option(..., help="Track code"),
-    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD"),
+    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD | auto | latest | today"),
     race_no: int | None = typer.Option(None, "--race-no", help="Single race number"),
+    lookback_days: int = typer.Option(14, help="Lookback days for auto/latest"),
+    skip_if_no_meet: bool = typer.Option(
+        True, "--skip-if-no-meet/--no-skip-if-no-meet", help="Skip if no meet"
+    ),
 ) -> None:
     """Fetch and store exacta odds."""
     from app.db.session import get_db
@@ -125,9 +148,33 @@ def fetch_odds_cmd(
         upsert_track,
     )
 
-    race_date = date.fromisoformat(dt)
-    client = AutoraceClient()
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
+    from app.services.odds_freshness import has_fresh_odds
+
+    client = AutoraceClient() if is_date_keyword(dt) else None
+    race_date, reason = resolve_date_with_reason(
+        track, dt, mode="fetch:odds", lookback_days=lookback_days, client=client
+    )
+    if race_date is None:
+        if skip_if_no_meet:
+            reason_text = "開催なし" if reason == "no_meet" else "解決失敗"
+            logger.info("Skip fetch:odds (%s) track=%s date=%s", reason_text, track, dt)
+            return
+        raise typer.Exit(code=1)
+
+    dt = race_date.isoformat()
     race_nos = [race_no] if race_no else None
+    with get_db() as db:
+        if has_fresh_odds(db, track, race_date):
+            logger.info(
+                "Skip fetch:odds (already fresh within 3 minutes) track=%s date=%s",
+                track,
+                dt,
+            )
+            return
+
+    if client is None:
+        client = AutoraceClient()
     odds_data = fetch_all_odds(client, track, race_date, race_nos=race_nos)
 
     captured_at = datetime.now(UTC)
@@ -163,8 +210,12 @@ def fetch_odds_cmd(
 @app.command("fetch:results")
 def fetch_results_cmd(
     track: str = typer.Option(..., help="Track code"),
-    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD"),
+    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD | auto | latest | today"),
     race_no: int | None = typer.Option(None, "--race-no", help="Single race number"),
+    lookback_days: int = typer.Option(14, help="Lookback days for auto/latest"),
+    skip_if_no_meet: bool = typer.Option(
+        True, "--skip-if-no-meet/--no-skip-if-no-meet", help="Skip if no meet"
+    ),
 ) -> None:
     """Fetch and store race results and exacta payouts."""
     from app.db.session import get_db
@@ -181,8 +232,22 @@ def fetch_results_cmd(
         upsert_track,
     )
 
-    race_date = date.fromisoformat(dt)
-    client = AutoraceClient()
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
+
+    client = AutoraceClient() if is_date_keyword(dt) else None
+    race_date, reason = resolve_date_with_reason(
+        track, dt, mode="fetch:results", lookback_days=lookback_days, client=client
+    )
+    if race_date is None:
+        if skip_if_no_meet:
+            reason_text = "開催なし" if reason == "no_meet" else "解決失敗"
+            logger.info("Skip fetch:results (%s) track=%s date=%s", reason_text, track, dt)
+            return
+        raise typer.Exit(code=1)
+
+    dt = race_date.isoformat()
+    if client is None:
+        client = AutoraceClient()
     race_nos = [race_no] if race_no else None
     results_data = fetch_all_results(client, track, race_date, race_nos=race_nos)
 
@@ -284,21 +349,39 @@ def train_model(
 @app.command("predict:exacta")
 def predict_exacta(
     track: str = typer.Option(..., help="Track code"),
-    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD"),
+    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD | auto | latest | today"),
     model_path: str = typer.Option(..., "--model", help="Path to model .pkl"),
     model_version: str = typer.Option("v0", "--model-version"),
     top: int = typer.Option(10, help="Top N predictions to show"),
+    lookback_days: int = typer.Option(14, help="Lookback days for auto/latest"),
+    skip_if_no_meet: bool = typer.Option(
+        True, "--skip-if-no-meet/--no-skip-if-no-meet", help="Skip if no meet"
+    ),
 ) -> None:
     """Generate and store exacta predictions for all races of a day."""
     from sqlalchemy import select
 
     from app.db.models import OddsExacta, Race, RaceDay
     from app.db.session import get_db
+    from app.scraping.http import AutoraceClient
     from app.services.features import get_race_features
     from app.services.modeling import ExactaModel
     from app.services.upsert import upsert_prediction_exacta, upsert_race_day, upsert_track
 
-    race_date = date.fromisoformat(dt)
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
+
+    client = AutoraceClient() if is_date_keyword(dt) else None
+    race_date, reason = resolve_date_with_reason(
+        track, dt, mode="predict:exacta", lookback_days=lookback_days, client=client
+    )
+    if race_date is None:
+        if skip_if_no_meet:
+            reason_text = "開催なし" if reason == "no_meet" else "解決失敗"
+            logger.info("Skip predict:exacta (%s) track=%s date=%s", reason_text, track, dt)
+            return
+        raise typer.Exit(code=1)
+
+    dt = race_date.isoformat()
     model = ExactaModel.load(model_path)
     predicted_at = datetime.now(UTC)
 

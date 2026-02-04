@@ -27,27 +27,27 @@ docker compose up -d --build
 
 # 2. race_day を同期
 docker compose run --rm worker python -m app.cli sync:race-days \
-  --track kawaguchi --from 2026-02-01 --to 2026-02-01
+  --track kawaguchi --from 2026-01-01 --to 2026-02-14
 
 # 3. 出走表（Program）を取得
 docker compose run --rm worker python -m app.cli fetch:program \
-  --track kawaguchi --date 2026-02-01
+  --track kawaguchi --date auto --skip-if-no-meet
 
 # 4. オッズ（Exacta Odds）を取得
 docker compose run --rm worker python -m app.cli fetch:odds \
-  --track kawaguchi --date 2026-02-01
+  --track kawaguchi --date auto --skip-if-no-meet
 
 # 5. 結果・払戻を取得
 docker compose run --rm worker python -m app.cli fetch:results \
-  --track kawaguchi --date 2026-02-01
+  --track kawaguchi --date auto --skip-if-no-meet
 
 # 6. モデル学習
 docker compose run --rm worker python -m app.cli train:model \
-  --from 2026-01-01 --to 2026-02-01 --out models/model.pkl
+  --from 2026-01-01 --to 2026-02-14 --out models/model.pkl
 
 # 7. 予測
 docker compose run --rm worker python -m app.cli predict:exacta \
-  --track kawaguchi --date 2026-02-01 \
+  --track kawaguchi --date auto --skip-if-no-meet \
   --model models/model.pkl --model-version v0
 
 # 8. API ヘルスチェック
@@ -73,6 +73,21 @@ curl http://localhost:8000/health
 | `fetch:results` | 着順と払戻を取得・格納 |
 | `train:model` | 過去データからモデルを学習 |
 | `predict:exacta` | 予測を実行・格納 |
+
+## 日付解決とスキップ動作
+
+- `--date` は `YYYY-MM-DD` に加えて `auto` / `latest` / `today` を指定可能
+  - `auto` / `latest`: 今日が開催なら今日、開催でなければ過去 14 日まで遡って開催日を探索
+  - `today`: 今日が開催でなければ `None` としてスキップ
+- `--skip-if-no-meet` が有効な場合、開催なし/解決失敗は何もせず exit 0（ログに理由を出力）
+- `fetch:odds` は同日で直近 3 分以内に取得済みのオッズがあれば `skip (already fresh)`
+
+## cron 運用例 (5分)
+
+```bash
+*/5 * * * * cd /app && python -m app.cli fetch:odds --track kawaguchi --date today --skip-if-no-meet
+*/5 * * * * cd /app && python -m app.cli predict:exacta --track kawaguchi --date today --skip-if-no-meet --model models/model.pkl --model-version v0
+```
 
 ## テスト
 
