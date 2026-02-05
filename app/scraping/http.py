@@ -25,17 +25,18 @@ PLACE_CODES: dict[str, int] = {
     "hamamatsu": 4,
     "iizuka": 5,
     "sanyou": 6,
+    # Night races have separate placeCode (base + 10)
+    "kawaguchi2": 12,
 }
-NIGHT_SUFFIX = "2"
 
 
 def resolve_place_code(track_code: str) -> int:
+    """Resolve track_code to API placeCode.
+
+    Night tracks (e.g., kawaguchi2) have separate placeCode values.
+    """
     if track_code in PLACE_CODES:
         return PLACE_CODES[track_code]
-    if track_code.endswith(NIGHT_SUFFIX):
-        base = track_code[: -len(NIGHT_SUFFIX)]
-        if base in PLACE_CODES:
-            return PLACE_CODES[base]
     raise KeyError(f"Unsupported track_code: {track_code}")
 
 

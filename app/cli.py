@@ -521,6 +521,122 @@ def predict_exacta(
         typer.echo(f"\nPredictions saved ({model_version})")
 
 
+# ---------------------------------------------------------------
+# recommend:purchase
+# ---------------------------------------------------------------
+@app.command("recommend:purchase")
+def recommend_purchase(
+    track: str = typer.Option(..., help="Track code"),
+    dt: str = typer.Option(..., "--date", help="Date YYYY-MM-DD | auto | latest | today"),
+    bankroll: int = typer.Option(10000, help="Available bankroll in Yen"),
+    kelly: float = typer.Option(0.25, help="Kelly fraction (0.25 = quarter Kelly)"),
+    min_ev: float = typer.Option(0.0, "--min-ev", help="Minimum EV threshold"),
+    model_version: str = typer.Option("v0", "--model-version", help="Filter by model version"),
+    lookback_days: int = typer.Option(14, help="Lookback days for auto/latest"),
+    skip_if_no_meet: bool = typer.Option(
+        True, "--skip-if-no-meet/--no-skip-if-no-meet", help="Skip if no meet"
+    ),
+) -> None:
+    """Generate purchase recommendations using Kelly Criterion."""
+    from sqlalchemy import select
+
+    from app.db.models import PredictionExacta, Race, RaceDay
+    from app.db.session import get_db
+    from app.scraping.http import AutoraceClient
+    from app.services.betting import format_purchase_plan, generate_purchase_plan
+    from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
+
+    client = AutoraceClient(init_track_code=track) if is_date_keyword(dt) else None
+    race_date, reason = resolve_date_with_reason(
+        track, dt, mode="recommend:purchase", lookback_days=lookback_days, client=client
+    )
+    if race_date is None:
+        if skip_if_no_meet:
+            reason_text = "開催なし" if reason == "no_meet" else "解決失敗"
+            logger.info("Skip recommend:purchase (%s) track=%s date=%s", reason_text, track, dt)
+            return
+        raise typer.Exit(code=1)
+
+    with get_db() as db:
+        # Get RaceDay
+        from app.services.upsert import upsert_track
+
+        t = upsert_track(db, track, TRACK_NAMES.get(track, track))
+        rd = db.execute(
+            select(RaceDay).where(
+                RaceDay.track_id == t.track_id, RaceDay.race_date == race_date
+            )
+        ).scalar_one_or_none()
+
+        if rd is None:
+            typer.echo(f"No race day found for {track} {race_date}")
+            raise typer.Exit(code=1)
+
+        # Get latest predictions for each race
+        races = (
+            db.execute(
+                select(Race)
+                .where(Race.race_day_id == rd.race_day_id)
+                .order_by(Race.race_no)
+            )
+            .scalars()
+            .all()
+        )
+
+        predictions: list[dict] = []
+        for race in races:
+            # Get latest prediction timestamp for this race and model version
+            latest_pred = db.execute(
+                select(PredictionExacta)
+                .where(
+                    PredictionExacta.race_id == race.race_id,
+                    PredictionExacta.model_version == model_version,
+                )
+                .order_by(PredictionExacta.predicted_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            if latest_pred is None:
+                continue
+
+            # Get all predictions at that timestamp
+            preds = (
+                db.execute(
+                    select(PredictionExacta).where(
+                        PredictionExacta.race_id == race.race_id,
+                        PredictionExacta.model_version == model_version,
+                        PredictionExacta.predicted_at == latest_pred.predicted_at,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            for p in preds:
+                if p.market_odds is not None and p.ev is not None:
+                    predictions.append(
+                        {
+                            "race_no": race.race_no,
+                            "first_car_no": p.first_car_no,
+                            "second_car_no": p.second_car_no,
+                            "prob": p.prob,
+                            "market_odds": p.market_odds,
+                            "ev": p.ev,
+                        }
+                    )
+
+        # Generate purchase plan
+        plan = generate_purchase_plan(
+            predictions=predictions,
+            bankroll=bankroll,
+            kelly_multiplier=kelly,
+            min_ev=min_ev,
+        )
+
+        typer.echo(f"\n{track.upper()} {race_date} (model: {model_version})")
+        typer.echo(format_purchase_plan(plan))
+
+
 def main() -> None:
     app()
 
