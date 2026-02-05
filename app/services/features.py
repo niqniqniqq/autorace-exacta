@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 import numpy as np
 from sqlalchemy import select
@@ -29,7 +30,16 @@ RELATIVE_FEATURE_NAMES = [
     "handicap_advantage",     # (max_handicap - handicap) / range, higher = more advantage
 ]
 
-FEATURE_NAMES = BASE_FEATURE_NAMES + RELATIVE_FEATURE_NAMES
+# Racer historical features
+RACER_HISTORY_FEATURE_NAMES = [
+    "hist_win_rate",          # Historical win rate (90 days)
+    "hist_place_rate",        # Historical 1st/2nd rate
+    "hist_show_rate",         # Historical 1st/2nd/3rd rate
+    "hist_avg_finish",        # Historical average finish position
+    "hist_race_count",        # Number of races in history (experience)
+]
+
+FEATURE_NAMES = BASE_FEATURE_NAMES + RELATIVE_FEATURE_NAMES + RACER_HISTORY_FEATURE_NAMES
 
 
 def entry_to_base_features(entry: RaceEntry) -> np.ndarray:
@@ -63,7 +73,6 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
     relative_handicap = handicaps - min_handicap
 
     # Relative trial time (0 = fastest in race)
-    # Handle case where trial_time is 0 (not yet available)
     valid_times = trial_times[trial_times > 0]
     if len(valid_times) > 0:
         min_trial = valid_times.min()
@@ -72,7 +81,6 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
         relative_trial = np.zeros(n)
 
     # Car position advantage (1番車 = 1.0, 8番車 = 0.0)
-    # Inside position (lower car_no) is generally advantageous
     max_car = car_nos.max()
     min_car = car_nos.min()
     if max_car > min_car:
@@ -80,7 +88,7 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
     else:
         car_position = np.ones(n) * 0.5
 
-    # Handicap advantage (higher handicap = disadvantage, so invert)
+    # Handicap advantage
     max_handicap = handicaps.max()
     handicap_range = max_handicap - min_handicap
     if handicap_range > 0:
@@ -88,7 +96,6 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
     else:
         handicap_advantage = np.ones(n) * 0.5
 
-    # Stack all relative features
     relative_feats = np.column_stack([
         relative_handicap,
         relative_trial,
@@ -99,10 +106,49 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
     return relative_feats
 
 
-def entries_to_features(entries: list[RaceEntry]) -> np.ndarray:
+def compute_racer_history_features(
+    db: Session,
+    entries: list[RaceEntry],
+    race_date: date,
+    lookback_days: int = 90,
+) -> np.ndarray:
+    """Compute racer historical features for all entries.
+
+    Returns (n_entries, n_history_features) array.
+    """
+    from app.services.racer_stats import get_racer_stats
+
+    n = len(entries)
+    if n == 0:
+        return np.zeros((0, len(RACER_HISTORY_FEATURE_NAMES)))
+
+    history_feats = []
+    for entry in entries:
+        stats = get_racer_stats(db, entry.racer_id, race_date, lookback_days)
+        history_feats.append([
+            stats.win_rate,
+            stats.place_rate,
+            stats.show_rate,
+            stats.avg_finish,
+            min(stats.race_count / 20.0, 1.0),  # Normalize: 20+ races = 1.0
+        ])
+
+    return np.array(history_feats, dtype=np.float64)
+
+
+def entries_to_features(
+    entries: list[RaceEntry],
+    db: Session | None = None,
+    race_date: date | None = None,
+) -> np.ndarray:
     """Extract full feature matrix for a list of entries.
 
-    Returns (n_entries, n_features) array combining base and relative features.
+    Args:
+        entries: List of race entries
+        db: Database session (required for racer history features)
+        race_date: Date of the race (required for racer history features)
+
+    Returns (n_entries, n_features) array combining all features.
     """
     if not entries:
         return np.zeros((0, len(FEATURE_NAMES)))
@@ -113,8 +159,19 @@ def entries_to_features(entries: list[RaceEntry]) -> np.ndarray:
     # Relative features
     relative_feats = compute_relative_features(entries)
 
+    # Racer history features
+    if db is not None and race_date is not None:
+        history_feats = compute_racer_history_features(db, entries, race_date)
+    else:
+        # Default values when history not available
+        n = len(entries)
+        history_feats = np.array([
+            [0.125, 0.25, 0.375, 4.5, 0.0]  # Default: uniform distribution
+            for _ in range(n)
+        ])
+
     # Combine
-    return np.hstack([base_feats, relative_feats])
+    return np.hstack([base_feats, relative_feats, history_feats])
 
 
 def build_training_data(
@@ -160,7 +217,10 @@ def build_training_data(
         if result.winner_car_no not in car_nos:
             continue
 
-        features = entries_to_features(entries)
+        # Get race date for history lookup
+        race_date = race.race_day.race_date
+
+        features = entries_to_features(entries, db=db, race_date=race_date)
         winner_idx = car_nos.index(result.winner_car_no)
 
         X_list.append(features.flatten())
@@ -190,6 +250,10 @@ def get_race_features(
     db: Session, race_id: int
 ) -> tuple[list[int], np.ndarray]:
     """Get car_nos and feature matrix for a single race."""
+    race = db.execute(
+        select(Race).where(Race.race_id == race_id)
+    ).scalar_one()
+
     entries = (
         db.execute(
             select(RaceEntry).where(RaceEntry.race_id == race_id).order_by(RaceEntry.car_no)
@@ -197,6 +261,9 @@ def get_race_features(
         .scalars()
         .all()
     )
+
     car_nos = [e.car_no for e in entries]
-    features = entries_to_features(list(entries))
+    race_date = race.race_day.race_date
+    features = entries_to_features(list(entries), db=db, race_date=race_date)
+
     return car_nos, features
