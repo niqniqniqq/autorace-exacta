@@ -15,6 +15,7 @@ dependencies = [
     "requests>=2.32,<3",
     "lxml>=5.0,<6",
     "scikit-learn>=1.5,<2",
+    "lightgbm>=4.0,<5",
     "typer>=0.14,<1",
     "python-dotenv>=1.0,<2",
     "pydantic>=2.0,<3",

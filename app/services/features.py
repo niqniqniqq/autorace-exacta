@@ -30,6 +30,13 @@ RELATIVE_FEATURE_NAMES = [
     "handicap_advantage",     # (max_handicap - handicap) / range, higher = more advantage
 ]
 
+# Interaction features (v6)
+INTERACTION_FEATURE_NAMES = [
+    "adjusted_time",          # trial_time + handicap * 0.001 (10m = 0.01s rule)
+    "adjusted_time_rank",     # rank of adjusted_time in race (1=best, normalized)
+    "trial_rank",             # rank of trial_time in race (1=fastest, normalized)
+]
+
 # Racer historical features
 RACER_HISTORY_FEATURE_NAMES = [
     "hist_win_rate",          # Historical win rate (90 days)
@@ -39,7 +46,7 @@ RACER_HISTORY_FEATURE_NAMES = [
     "hist_race_count",        # Number of races in history (experience)
 ]
 
-FEATURE_NAMES = BASE_FEATURE_NAMES + RELATIVE_FEATURE_NAMES + RACER_HISTORY_FEATURE_NAMES
+FEATURE_NAMES = BASE_FEATURE_NAMES + RELATIVE_FEATURE_NAMES + INTERACTION_FEATURE_NAMES + RACER_HISTORY_FEATURE_NAMES
 
 
 def entry_to_base_features(entry: RaceEntry) -> np.ndarray:
@@ -106,6 +113,70 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
     return relative_feats
 
 
+def compute_interaction_features(entries: list[RaceEntry]) -> np.ndarray:
+    """Compute interaction features for all entries in a race.
+
+    Returns (n_entries, n_interaction_features) array.
+    """
+    n = len(entries)
+    if n == 0:
+        return np.zeros((0, len(INTERACTION_FEATURE_NAMES)))
+
+    handicaps = np.array([e.handicap_m or 0 for e in entries], dtype=np.float64)
+    trial_times = np.array([e.trial_time or 0.0 for e in entries], dtype=np.float64)
+
+    # Adjusted time: trial + handicap * 0.001 (10m = 0.01s rule)
+    adjusted_time = np.where(
+        trial_times > 0,
+        trial_times + handicaps * 0.001,
+        0.0
+    )
+
+    # Adjusted time rank (1=best, normalized to 0-1)
+    valid_adjusted = adjusted_time[adjusted_time > 0]
+    if len(valid_adjusted) > 0:
+        # Rank: lower adjusted time = better rank
+        ranks = np.zeros(n)
+        valid_indices = np.where(adjusted_time > 0)[0]
+        sorted_indices = valid_indices[np.argsort(adjusted_time[valid_indices])]
+        for rank, idx in enumerate(sorted_indices):
+            ranks[idx] = rank + 1
+        # Normalize: 1=best -> 1.0, last -> 0.0
+        max_rank = len(valid_adjusted)
+        adjusted_time_rank = np.where(
+            adjusted_time > 0,
+            1.0 - (ranks - 1) / max(max_rank - 1, 1),
+            0.5
+        )
+    else:
+        adjusted_time_rank = np.ones(n) * 0.5
+
+    # Trial time rank (1=fastest, normalized to 0-1)
+    valid_trials = trial_times[trial_times > 0]
+    if len(valid_trials) > 0:
+        ranks = np.zeros(n)
+        valid_indices = np.where(trial_times > 0)[0]
+        sorted_indices = valid_indices[np.argsort(trial_times[valid_indices])]
+        for rank, idx in enumerate(sorted_indices):
+            ranks[idx] = rank + 1
+        max_rank = len(valid_trials)
+        trial_rank = np.where(
+            trial_times > 0,
+            1.0 - (ranks - 1) / max(max_rank - 1, 1),
+            0.5
+        )
+    else:
+        trial_rank = np.ones(n) * 0.5
+
+    interaction_feats = np.column_stack([
+        adjusted_time,
+        adjusted_time_rank,
+        trial_rank,
+    ])
+
+    return interaction_feats
+
+
 def compute_racer_history_features(
     db: Session,
     entries: list[RaceEntry],
@@ -159,6 +230,9 @@ def entries_to_features(
     # Relative features
     relative_feats = compute_relative_features(entries)
 
+    # Interaction features
+    interaction_feats = compute_interaction_features(entries)
+
     # Racer history features
     if db is not None and race_date is not None:
         history_feats = compute_racer_history_features(db, entries, race_date)
@@ -171,7 +245,7 @@ def entries_to_features(
         ])
 
     # Combine
-    return np.hstack([base_feats, relative_feats, history_feats])
+    return np.hstack([base_feats, relative_feats, interaction_feats, history_feats])
 
 
 def build_training_data(
