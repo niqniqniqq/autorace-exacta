@@ -20,9 +20,10 @@ class ExactaModel:
 
     def __init__(self) -> None:
         self.scaler = StandardScaler()
-        self.model = LogisticRegression(max_iter=1000)
+        self.model = LogisticRegression(max_iter=2000, C=0.5)  # More iterations, some regularization
         self.n_features = len(FEATURE_NAMES)
         self.is_fitted = False
+        self.feature_names = FEATURE_NAMES  # Store for inspection
 
     def fit(self, X: np.ndarray, y: np.ndarray, meta: list[dict]) -> None:
         """Train the model.
@@ -99,7 +100,13 @@ class ExactaModel:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump({"scaler": self.scaler, "model": self.model, "is_fitted": self.is_fitted}, f)
+            pickle.dump({
+                "scaler": self.scaler,
+                "model": self.model,
+                "is_fitted": self.is_fitted,
+                "n_features": self.n_features,
+                "feature_names": self.feature_names,
+            }, f)
         logger.info("Model saved to %s", path)
 
     @classmethod
@@ -110,5 +117,18 @@ class ExactaModel:
         obj.scaler = data["scaler"]
         obj.model = data["model"]
         obj.is_fitted = data["is_fitted"]
+        obj.n_features = data.get("n_features", len(FEATURE_NAMES))
+        obj.feature_names = data.get("feature_names", FEATURE_NAMES)
         logger.info("Model loaded from %s", path)
         return obj
+
+    def get_feature_importance(self) -> list[tuple[str, float]]:
+        """Return feature names and their coefficients (importance)."""
+        if not self.is_fitted:
+            return []
+        coefs = self.model.coef_[0]
+        return sorted(
+            zip(self.feature_names, coefs),
+            key=lambda x: abs(x[1]),
+            reverse=True,
+        )

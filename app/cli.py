@@ -95,27 +95,38 @@ def fetch_program(
     dt = race_date.isoformat()
     if client is None:
         client = AutoraceClient(init_track_code=track)
-    programs = fetch_all_programs(client, track, race_date)
+
+    from app.services.meet_resolver import resolve_active_race_nos
+
+    cache: dict[int, dict] = {}
+    active_nos = resolve_active_race_nos(client, track, race_date, program_cache=cache)
+    if not active_nos:
+        logger.info("No active races for %s %s — nothing to fetch.", track, dt)
+        return
+
+    programs = fetch_all_programs(
+        client, track, race_date, race_nos=active_nos, preloaded=cache
+    )
 
     with get_db() as db:
         t = upsert_track(db, track, TRACK_NAMES.get(track, track))
         rd = upsert_race_day(db, t.track_id, race_date)
 
         total_entries = 0
-        for race_no_idx, prog_data in enumerate(programs, start=1):
+        for race_no, prog_data in programs:
             storage_uri, chash = save_json_snapshot("program", track, dt, prog_data)
             snap = upsert_snapshot(
                 db,
                 source="program",
-                url=f"autorace.jp/program/{track}/{dt}/R{race_no_idx}",
+                url=f"autorace.jp/program/{track}/{dt}/R{race_no}",
                 fetched_at=datetime.now(timezone.utc),
                 http_status=200,
                 content_hash=chash,
                 content_type="application/json",
                 storage_uri=storage_uri,
             )
-            race = upsert_race(db, rd.race_day_id, race_no_idx)
-            entries = parse_program(prog_data, race_no_idx)
+            race = upsert_race(db, rd.race_day_id, race_no)
+            entries = parse_program(prog_data, race_no)
             for entry in entries:
                 upsert_entry(db, race.race_id, entry, snap.snapshot_id)
                 total_entries += 1
@@ -167,7 +178,6 @@ def fetch_odds_cmd(
         raise typer.Exit(code=1)
 
     dt = race_date.isoformat()
-    race_nos = [race_no] if race_no else None
     with get_db() as db:
         if has_fresh_odds(db, track, race_date):
             logger.info(
@@ -179,6 +189,17 @@ def fetch_odds_cmd(
 
     if client is None:
         client = AutoraceClient(init_track_code=track)
+
+    if race_no:
+        race_nos: list[int] | None = [race_no]
+    else:
+        from app.services.meet_resolver import resolve_active_race_nos
+
+        race_nos = resolve_active_race_nos(client, track, race_date) or None
+        if race_nos is None:
+            logger.info("No active races for %s %s — nothing to fetch.", track, dt)
+            return
+
     odds_data = fetch_all_odds(client, track, race_date, race_nos=race_nos)
 
     captured_at = datetime.now(timezone.utc)
@@ -264,7 +285,17 @@ def fetch_results_cmd(
     dt = race_date.isoformat()
     if client is None:
         client = AutoraceClient(init_track_code=track)
-    race_nos = [race_no] if race_no else None
+
+    if race_no:
+        race_nos: list[int] | None = [race_no]
+    else:
+        from app.services.meet_resolver import resolve_active_race_nos
+
+        race_nos = resolve_active_race_nos(client, track, race_date) or None
+        if race_nos is None:
+            logger.info("No active races for %s %s — nothing to fetch.", track, dt)
+            return
+
     results_data = fetch_all_results(client, track, race_date, race_nos=race_nos)
 
     with get_db() as db:
@@ -399,6 +430,16 @@ def predict_exacta(
         raise typer.Exit(code=1)
 
     dt = race_date.isoformat()
+    if client is None:
+        client = AutoraceClient(init_track_code=track)
+
+    from app.services.meet_resolver import resolve_active_race_nos
+
+    active_nos = resolve_active_race_nos(client, track, race_date)
+    if not active_nos:
+        logger.info("No active races for %s %s — nothing to predict.", track, dt)
+        return
+
     model = ExactaModel.load(model_path)
     predicted_at = datetime.now(timezone.utc)
 
@@ -410,6 +451,7 @@ def predict_exacta(
             db.execute(
                 select(Race)
                 .where(Race.race_day_id == rd.race_day_id)
+                .where(Race.race_no.in_(active_nos))
                 .order_by(Race.race_no)
             )
             .scalars()

@@ -34,7 +34,7 @@ def fetch_all_odds(
     track_code: str,
     race_date: date,
     race_nos: list[int] | None = None,
-    max_race_no: int = 12,
+    max_race_no: int = 14,
 ) -> list[tuple[int, dict[str, Any]]]:
     """Fetch odds for specified races (or all). Returns [(race_no, data)]."""
     if race_nos is None:
