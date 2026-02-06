@@ -20,6 +20,7 @@ BASE_FEATURE_NAMES = [
     "deviation",
     "quinella_rate",
     "trio_rate",
+    "start_avg",  # 90日間スタート平均タイム
 ]
 
 # Relative features (computed within race context)
@@ -28,6 +29,7 @@ RELATIVE_FEATURE_NAMES = [
     "relative_trial_time",    # trial_time - min_trial_time (lower is better)
     "car_position",           # normalized car_no position (1=inside, 0=outside)
     "handicap_advantage",     # (max_handicap - handicap) / range, higher = more advantage
+    "relative_start",         # start_avg - min_start_avg in race (lower is better)
 ]
 
 # Interaction features (v6)
@@ -57,6 +59,7 @@ def entry_to_base_features(entry: RaceEntry) -> np.ndarray:
         entry.deviation or 50.0,
         entry.quinella_rate or 0.0,
         entry.trio_rate or 0.0,
+        entry.start_avg or 0.15,  # Default to average start time
     ]
     return np.array(vals, dtype=np.float64)
 
@@ -74,6 +77,7 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
     handicaps = np.array([e.handicap_m or 0 for e in entries], dtype=np.float64)
     trial_times = np.array([e.trial_time or 0.0 for e in entries], dtype=np.float64)
     car_nos = np.array([e.car_no for e in entries], dtype=np.float64)
+    start_avgs = np.array([e.start_avg or 0.15 for e in entries], dtype=np.float64)
 
     # Relative handicap (0 = minimum handicap in race)
     min_handicap = handicaps.min()
@@ -103,11 +107,20 @@ def compute_relative_features(entries: list[RaceEntry]) -> np.ndarray:
     else:
         handicap_advantage = np.ones(n) * 0.5
 
+    # Relative start (0 = fastest starter in race)
+    valid_starts = start_avgs[start_avgs > 0]
+    if len(valid_starts) > 0:
+        min_start = valid_starts.min()
+        relative_start = np.where(start_avgs > 0, start_avgs - min_start, 0.0)
+    else:
+        relative_start = np.zeros(n)
+
     relative_feats = np.column_stack([
         relative_handicap,
         relative_trial,
         car_position,
         handicap_advantage,
+        relative_start,
     ])
 
     return relative_feats
@@ -321,9 +334,15 @@ def build_training_data(
 
 
 def get_race_features(
-    db: Session, race_id: int
+    db: Session, race_id: int, *, active_car_nos: list[int] | None = None
 ) -> tuple[list[int], np.ndarray]:
-    """Get car_nos and feature matrix for a single race."""
+    """Get car_nos and feature matrix for a single race.
+
+    Args:
+        db: Database session
+        race_id: Race ID
+        active_car_nos: If provided, filter to only these car numbers (for absent player handling)
+    """
     race = db.execute(
         select(Race).where(Race.race_id == race_id)
     ).scalar_one()
@@ -335,6 +354,11 @@ def get_race_features(
         .scalars()
         .all()
     )
+
+    # Filter to active entries if specified (handles absent players)
+    if active_car_nos is not None:
+        active_set = set(active_car_nos)
+        entries = [e for e in entries if e.car_no in active_set]
 
     car_nos = [e.car_no for e in entries]
     race_date = race.race_day.race_date

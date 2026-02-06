@@ -20,6 +20,7 @@ class EntryData:
     deviation: float | None
     quinella_rate: float | None
     trio_rate: float | None
+    start_avg: float | None  # 90日間スタート平均タイム
     stats_json: dict[str, Any] = field(default_factory=dict)
 
 
@@ -48,12 +49,22 @@ def parse_program(api_response: dict[str, Any], race_no: int) -> list[EntryData]
     if not player_list:
         return []
 
+    # Extract 90-day stats for start average
+    latest90 = body.get("latest90List") or {}
+
     entries: list[EntryData] = []
     for p in player_list:
         try:
+            player_code = str(p["playerCode"]) if p.get("playerCode") else None
+
+            # Get start average from latest90List (keyed by player code)
+            start_avg = None
+            if player_code and player_code in latest90:
+                start_avg = _safe_float(latest90[player_code].get("stAve"))
+
             entry = EntryData(
                 car_no=int(p.get("carNo", 0)),
-                racer_code=str(p["playerCode"]) if p.get("playerCode") else None,
+                racer_code=player_code,
                 racer_name=p.get("playerName", ""),
                 handicap_m=_safe_int(p.get("handicap")),
                 machine_name=p.get("bikeName"),
@@ -61,6 +72,7 @@ def parse_program(api_response: dict[str, Any], race_no: int) -> list[EntryData]
                 deviation=_safe_float(p.get("raceDev")),
                 quinella_rate=_safe_float(p.get("rate2")),
                 trio_rate=_safe_float(p.get("rate3")),
+                start_avg=start_avg,
                 stats_json={
                     "rank": p.get("rank"),
                     "age": p.get("age"),

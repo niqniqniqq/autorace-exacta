@@ -29,7 +29,7 @@ alembic upgrade head                   # マイグレーション
 - POST /race_info/Odds — オッズ (要CSRF)
 - POST /race_info/RaceResult — 結果 (要CSRF)
 - placeCode: kawaguchi=2, isesaki=3, hamamatsu=4, iizuka=5, sanyou=6
-- ナイト開催 (kawaguchi2, isesaki2) は同じplaceCodeを使用、Track別管理
+- **ナイト開催は別placeCode**: kawaguchi2=12 (base+10) ※昼と異なるので注意
 
 ## CLI日付解決
 - `--date` は `YYYY-MM-DD` / `auto` / `latest` / `today` を受け付ける
@@ -53,6 +53,11 @@ alembic upgrade head                   # マイグレーション
 - car_position: 車番位置 (1番車=1.0, 8番車=0.0)
 - handicap_advantage: ハンデ有利度 (0mが最有利=1.0)
 
+### 交互作用特徴量 (v6で追加)
+- adjusted_time: 試走 + ハンデ×0.001 (10m≈0.01秒の補正)
+- adjusted_time_rank: 補正タイムの順位 (正規化)
+- trial_rank: 試走タイムの順位 (正規化)
+
 ### 選手履歴特徴量 (app/services/racer_stats.py)
 - hist_win_rate: 過去90日の勝率
 - hist_place_rate: 過去90日の2連率
@@ -61,20 +66,21 @@ alembic upgrade head                   # マイグレーション
 - hist_race_count: 経験値 (正規化済み)
 
 ## モデル
-- models/model.pkl — 基本モデル (v1)
-- models/model_v2.pkl — 相対特徴量追加
-- models/model_v3.pkl — 選手履歴追加 (推奨)
+- models/model.pkl — 最新推奨モデル (=v6)
+- models/model_v6.pkl — 17特徴量, 45.6%精度 **(推奨)**
+- models/model_v7_lgb.pkl — LightGBM (過学習、非推奨)
 
 ## 予測のベストプラクティス
 1. **発走直前にプログラム再取得** — 試走タイムは発走前に発表される
-2. **オッズ確定後に予測** — 全56組揃ってから実行
+2. **オッズ確定後に予測** — 全組合せ揃ってから (昼8頭=56組, ナイト7頭=42組)
 3. **選手履歴が効く** — 過去実績のある選手ほど予測精度が高い
+4. **placeCode注意** — ナイト(kawaguchi2)は12、昼(kawaguchi)は2
 
 ```bash
 # 予測フロー例
 docker compose run --rm worker python -m app.cli fetch:program --track kawaguchi --date today
 docker compose run --rm worker python -m app.cli fetch:odds --track kawaguchi --date today --race-no 12
-docker compose run --rm worker python -m app.cli predict:exacta --track kawaguchi --date today --model models/model_v3.pkl
+docker compose run --rm worker python -m app.cli predict:exacta --track kawaguchi --date today --model models/model.pkl
 ```
 
 ## 重要な制約

@@ -406,7 +406,7 @@ def predict_exacta(
     ),
 ) -> None:
     """Generate and store exacta predictions for all races of a day."""
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from app.db.models import OddsExacta, Race, RaceDay
     from app.db.session import get_db
@@ -472,7 +472,21 @@ def predict_exacta(
                     race.race_no,
                 )
                 continue
-            car_nos, feats = get_race_features(db, race.race_id)
+
+            # Get active car_nos from odds (handles absent players)
+            latest_captured = db.scalar(
+                select(func.max(OddsExacta.captured_at)).where(OddsExacta.race_id == race.race_id)
+            )
+            active_car_nos = list(
+                db.scalars(
+                    select(OddsExacta.first_car_no.distinct()).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+            )
+
+            car_nos, feats = get_race_features(db, race.race_id, active_car_nos=active_car_nos)
             if len(car_nos) < 2:
                 continue
 
