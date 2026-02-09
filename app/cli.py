@@ -391,6 +391,69 @@ def train_model(
 
 
 # ---------------------------------------------------------------
+# train:model-v12
+# ---------------------------------------------------------------
+@app.command("train:model-v12")
+def train_model_v12(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v12_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+) -> None:
+    """Train v12 LightGBM model with time-series CV (14 features)."""
+    from app.db.session import get_db
+    from app.services.training import train_v12_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v12_model(db, d_from, d_to, n_folds=n_folds)
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v12 Training Report ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances
+        typer.echo(f"\n--- Feature Importances ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>25s}: {imp:4d} {bar}")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v12",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
 # predict:exacta
 # ---------------------------------------------------------------
 @app.command("predict:exacta")
@@ -415,6 +478,7 @@ def predict_exacta(
     from app.services.features import get_race_features
     from app.services.modeling import ExactaModel
     from app.services.modeling_v11 import ExactaModelV11, extract_v11_features
+    from app.services.modeling_v12 import ExactaModelV12, extract_v12_features
     from app.services.upsert import upsert_prediction_exacta, upsert_race_day, upsert_track
 
     from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
@@ -442,8 +506,12 @@ def predict_exacta(
         return
 
     # Detect model type and load accordingly
-    is_v11 = ExactaModelV11.is_v11_model(model_path)
-    if is_v11:
+    is_v12 = ExactaModelV12.is_v12_model(model_path)
+    is_v11 = not is_v12 and ExactaModelV11.is_v11_model(model_path)
+    if is_v12:
+        model = ExactaModelV12.load(model_path)
+        logger.info("Using v12 LightGBM model with 14 features")
+    elif is_v11:
         model = ExactaModelV11.load(model_path)
         logger.info("Using v11 LightGBM model with 8 raw features")
     else:
@@ -494,8 +562,8 @@ def predict_exacta(
                 ).all()
             )
 
-            if is_v11:
-                # v11 uses raw features extracted directly from entries
+            if is_v12 or is_v11:
+                import numpy as np
                 entries = sorted(
                     [e for e in race.entries if e.car_no in active_car_nos],
                     key=lambda e: e.car_no
@@ -503,8 +571,10 @@ def predict_exacta(
                 car_nos = [e.car_no for e in entries]
                 if len(car_nos) < 2:
                     continue
-                import numpy as np
-                feats = np.array([extract_v11_features(e) for e in entries])
+                if is_v12:
+                    feats = np.array([extract_v12_features(e) for e in entries])
+                else:
+                    feats = np.array([extract_v11_features(e) for e in entries])
             else:
                 car_nos, feats = get_race_features(db, race.race_id, active_car_nos=active_car_nos)
                 if len(car_nos) < 2:
@@ -573,10 +643,23 @@ def backtest_exacta(
     from app.services.features import entries_to_features
     from app.services.modeling_v2 import ExactaModelV2
     from app.services.modeling_v11 import ExactaModelV11, extract_v11_features
+    from app.services.modeling_v12 import ExactaModelV12, extract_v12_features
 
     # Detect model type and load accordingly
-    is_v11 = ExactaModelV11.is_v11_model(model_path)
-    if is_v11:
+    is_v12 = ExactaModelV12.is_v12_model(model_path)
+    is_v11 = not is_v12 and ExactaModelV11.is_v11_model(model_path)
+
+    if is_v12:
+        model = ExactaModelV12.load(model_path)
+        logger.info("Using v12 LightGBM model with 9 features")
+
+        def feature_extractor_v12(db, race: Race, entries: list[RaceEntry]):
+            car_nos = [e.car_no for e in entries]
+            feats = [extract_v12_features(entry) for entry in entries]
+            return car_nos, np.array(feats)
+
+        feature_extractor = feature_extractor_v12
+    elif is_v11:
         model = ExactaModelV11.load(model_path)
         logger.info("Using v11 LightGBM model with 8 raw features")
 
