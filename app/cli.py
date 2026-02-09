@@ -556,6 +556,71 @@ def predict_exacta(
 
 
 # ---------------------------------------------------------------
+# backtest:exacta
+# ---------------------------------------------------------------
+@app.command("backtest:exacta")
+def backtest_exacta(
+    model_path: str = typer.Option(..., "--model", help="Path to model .pkl"),
+    bet_amount: float = typer.Option(100.0, "--bet", help="Bet amount per combination"),
+    min_odds: float = typer.Option(3.0, "--min-odds", help="Minimum odds for top prediction"),
+) -> None:
+    """Run backtest on races with both odds and results."""
+    import numpy as np
+
+    from app.db.session import get_db
+    from app.services.backtest import get_backtest_races, run_backtest
+    from app.services.features import extract_features
+    from app.services.modeling import ExactaModel
+    from app.services.modeling_v11 import ExactaModelV11, extract_v11_features
+
+    # Detect model type and load accordingly
+    is_v11 = ExactaModelV11.is_v11_model(model_path)
+    if is_v11:
+        model = ExactaModelV11.load(model_path)
+        feature_extractor = extract_v11_features
+        logger.info("Using v11 LightGBM model with 8 raw features")
+    else:
+        model = ExactaModel.load(model_path)
+        feature_extractor = extract_features
+        logger.info("Using v2 LogisticRegression model")
+
+    with get_db() as db:
+        races = get_backtest_races(db)
+        if not races:
+            typer.echo("No races found with both odds and results.")
+            return
+
+        typer.echo(f"Found {len(races)} races for backtest")
+
+        summary = run_backtest(
+            db, model, feature_extractor, bet_amount=bet_amount, min_odds=min_odds
+        )
+
+        # Display summary
+        typer.echo("\n=== Backtest Summary ===")
+        typer.echo(f"Total races: {summary.total_races}")
+        typer.echo(f"Top-1 hits: {summary.top1_hits}/{summary.total_races} ({summary.top1_accuracy:.1%})")
+        typer.echo(f"EV+ races: {summary.ev_plus_races}")
+        typer.echo(f"EV+ hits: {summary.ev_plus_hits}/{summary.ev_plus_races} ({summary.ev_plus_accuracy:.1%})" if summary.ev_plus_races > 0 else "EV+ hits: 0/0")
+        typer.echo(f"Total bets: {summary.total_bets}")
+        typer.echo(f"Total invested: ¥{summary.total_invested:,.0f}")
+        typer.echo(f"Total return: ¥{summary.total_return:,.0f}")
+        typer.echo(f"Profit: ¥{summary.profit:+,.0f}")
+        typer.echo(f"ROI: {summary.roi:.1%}")
+
+        # Show individual race results
+        typer.echo("\n=== Race Details ===")
+        for r in summary.results:
+            hit_mark = "✓" if r.hit else " "
+            ev_mark = "EV✓" if r.ev_plus_hit else "EV " if r.ev_plus_bets else "   "
+            typer.echo(
+                f"{r.race_date} {r.track_code} R{r.race_no:2d}: "
+                f"pred={r.pred_1st}-{r.pred_2nd} actual={r.actual_1st}-{r.actual_2nd} "
+                f"[{hit_mark}] [{ev_mark}] profit=¥{r.profit:+,.0f}"
+            )
+
+
+# ---------------------------------------------------------------
 # recommend:purchase
 # ---------------------------------------------------------------
 @app.command("recommend:purchase")

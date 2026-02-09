@@ -115,13 +115,12 @@ models/model_v11_lgb.pkl — 8生特徴量, 1着的中率64%
 | EV+ の組合せあり | **EV+のみ購入** |
 
 ```bash
-# 予測フロー例
+# 予測フロー例 (v11モデル)
 docker compose run --rm worker python -m app.cli fetch:program --track sanyou --date today
 docker compose run --rm worker python -m app.cli fetch:odds --track sanyou --date today
-docker compose run --rm worker python -m app.cli predict:exacta --track sanyou --date today --model models/model_v11_lgb.pkl
+docker compose run --rm worker python -m app.cli predict:exacta --track sanyou --date today \
+  --model models/model_v11_lgb.pkl --model-version v11
 ```
-
-**注意**: v11モデルは現在CLIに未統合。Pythonスクリプトで直接使用。
 
 ## 重要な制約
 - 公開ページのみ使用。ログイン・課金壁の回避禁止
