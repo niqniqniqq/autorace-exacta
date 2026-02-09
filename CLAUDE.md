@@ -43,32 +43,48 @@ alembic upgrade head                   # マイグレーション
 - 全CLIコマンド (fetch:program, fetch:odds, fetch:results, predict:exacta) で自動適用
 - max_race_no のデフォルトは14（川口ナイトは12レース、昼開催も可変）
 
-## 特徴量 (app/services/features.py)
-### 基本特徴量
-- handicap_m, trial_time, deviation, quinella_rate, trio_rate
+## 特徴量 (app/services/features.py) — 全23特徴量
 
-### 相対特徴量 (レース内での相対位置)
+### 基本特徴量 (6)
+- handicap_m, trial_time, deviation, quinella_rate, trio_rate
+- **start_avg**: 90日間スタート平均タイム (v9で追加)
+
+### 相対特徴量 (5)
 - relative_handicap: 最小ハンデとの差
 - relative_trial_time: 最速試走との差
 - car_position: 車番位置 (1番車=1.0, 8番車=0.0)
 - handicap_advantage: ハンデ有利度 (0mが最有利=1.0)
+- **relative_start**: 最速スタートとの差 (v9で追加)
 
-### 交互作用特徴量 (v6で追加)
+### 交互作用特徴量 (3)
 - adjusted_time: 試走 + ハンデ×0.001 (10m≈0.01秒の補正)
 - adjusted_time_rank: 補正タイムの順位 (正規化)
 - trial_rank: 試走タイムの順位 (正規化)
 
-### 選手履歴特徴量 (app/services/racer_stats.py)
+### 選手履歴特徴量 (5)
 - hist_win_rate: 過去90日の勝率
 - hist_place_rate: 過去90日の2連率
 - hist_show_rate: 過去90日の3連率
 - hist_avg_finish: 過去90日の平均着順
 - hist_race_count: 経験値 (正規化済み)
 
+### プロファイル特徴量 (4, v10で追加)
+- rank_class: ランク (S=2, A=1, B=0)
+- is_young: 35歳未満 → 1.0
+- is_home: ホームトラック → 1.0
+- handicap_start_interaction: 重ハンデ×速スタートの交互作用
+
 ## モデル
-- models/model.pkl — 最新推奨モデル (=v6)
-- models/model_v6.pkl — 17特徴量, 45.6%精度 **(推奨)**
+- **models/model_v10.pkl** — 23特徴量, LogisticRegression **(現在の推奨)**
+- models/model_v9.pkl — 19特徴量 (start_avg追加版)
+- models/model_v6.pkl — 17特徴量, 45.6%精度
 - models/model_v7_lgb.pkl — LightGBM (過学習、非推奨)
+- models/model_v2_separate.pkl — 1着/2着分離モデル (検証中)
+
+### 1着/2着分離モデル (app/services/modeling_v2.py)
+- 1着予測と2着予測を別々のLogisticRegressionで学習
+- P(i-j) = P(i wins) × P(j is 2nd | i wins)
+- 2着予測で「ST速い選手が2着に流れる」傾向を捉える狙い
 
 ## 予測のベストプラクティス
 1. **発走直前にプログラム再取得** — 試走タイムは発走前に発表される
@@ -76,11 +92,20 @@ alembic upgrade head                   # マイグレーション
 3. **選手履歴が効く** — 過去実績のある選手ほど予測精度が高い
 4. **placeCode注意** — ナイト(kawaguchi2)は12、昼(kawaguchi)は2
 
+### 購入判断基準 (EV-based)
+予測結果から購入すべきかを判断：
+
+| 条件 | 判断 |
+|------|------|
+| トップ組合せのオッズ < 3.0 | **スキップ** (低オッズでBOX負け) |
+| EV+ (prob × odds > 1) の組合せがない | **スキップ** |
+| EV+ の組合せあり | **EV+のみ購入** |
+
 ```bash
 # 予測フロー例
-docker compose run --rm worker python -m app.cli fetch:program --track kawaguchi --date today
-docker compose run --rm worker python -m app.cli fetch:odds --track kawaguchi --date today --race-no 12
-docker compose run --rm worker python -m app.cli predict:exacta --track kawaguchi --date today --model models/model.pkl
+docker compose run --rm worker python -m app.cli fetch:program --track kawaguchi2 --date today
+docker compose run --rm worker python -m app.cli fetch:odds --track kawaguchi2 --date today
+docker compose run --rm worker python -m app.cli predict:exacta --track kawaguchi2 --date today --model models/model_v10.pkl
 ```
 
 ## 重要な制約

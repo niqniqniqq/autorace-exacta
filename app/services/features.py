@@ -48,7 +48,15 @@ RACER_HISTORY_FEATURE_NAMES = [
     "hist_race_count",        # Number of races in history (experience)
 ]
 
-FEATURE_NAMES = BASE_FEATURE_NAMES + RELATIVE_FEATURE_NAMES + INTERACTION_FEATURE_NAMES + RACER_HISTORY_FEATURE_NAMES
+# Profile features (v10)
+PROFILE_FEATURE_NAMES = [
+    "rank_class",             # S=2, A=1, B=0
+    "is_young",               # age < 35 → 1.0
+    "is_home",                # racing at home track → 1.0
+    "handicap_start_interaction",  # relative_handicap * (1 - relative_start_norm)
+]
+
+FEATURE_NAMES = BASE_FEATURE_NAMES + RELATIVE_FEATURE_NAMES + INTERACTION_FEATURE_NAMES + RACER_HISTORY_FEATURE_NAMES + PROFILE_FEATURE_NAMES
 
 
 def entry_to_base_features(entry: RaceEntry) -> np.ndarray:
@@ -220,10 +228,83 @@ def compute_racer_history_features(
     return np.array(history_feats, dtype=np.float64)
 
 
+def compute_profile_features(
+    entries: list[RaceEntry],
+    track_code: str | None = None,
+    relative_handicap: np.ndarray | None = None,
+    relative_start: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute profile-based features for all entries.
+
+    Returns (n_entries, n_profile_features) array.
+    """
+    n = len(entries)
+    if n == 0:
+        return np.zeros((0, len(PROFILE_FEATURE_NAMES)))
+
+    # Track name mappings for home detection
+    track_place_map = {
+        "kawaguchi": "川口",
+        "kawaguchi2": "川口",
+        "hamamatsu": "浜松",
+        "iizuka": "飯塚",
+        "isesaki": "伊勢崎",
+        "sanyou": "山陽",
+    }
+    home_place = track_place_map.get(track_code, "") if track_code else ""
+
+    rank_class = []
+    is_young = []
+    is_home = []
+
+    for e in entries:
+        stats = e.stats_json or {}
+
+        # Rank class: S=2, A=1, B=0
+        rank_str = stats.get("rank", "")
+        if rank_str.startswith("S"):
+            rank_class.append(2.0)
+        elif rank_str.startswith("A"):
+            rank_class.append(1.0)
+        else:
+            rank_class.append(0.0)
+
+        # Is young: age < 35
+        age = stats.get("age", 40)
+        is_young.append(1.0 if age and age < 35 else 0.0)
+
+        # Is home track
+        place_name = stats.get("place_name", "").replace("\u3000", "").strip()
+        is_home.append(1.0 if home_place and home_place in place_name else 0.0)
+
+    rank_class = np.array(rank_class, dtype=np.float64)
+    is_young = np.array(is_young, dtype=np.float64)
+    is_home = np.array(is_home, dtype=np.float64)
+
+    # Handicap × Start interaction
+    # Higher value = heavy handicap + fast start (advantageous combination)
+    if relative_handicap is not None and relative_start is not None:
+        # Normalize relative_start to 0-1 range (0 = fastest)
+        max_rel_start = relative_start.max() if relative_start.max() > 0 else 1.0
+        rel_start_norm = relative_start / max_rel_start
+        # Interaction: high handicap (relative_handicap) + fast start (1 - rel_start_norm)
+        handicap_start_interaction = relative_handicap * (1.0 - rel_start_norm)
+    else:
+        handicap_start_interaction = np.zeros(n)
+
+    return np.column_stack([
+        rank_class,
+        is_young,
+        is_home,
+        handicap_start_interaction,
+    ])
+
+
 def entries_to_features(
     entries: list[RaceEntry],
     db: Session | None = None,
     race_date: date | None = None,
+    track_code: str | None = None,
 ) -> np.ndarray:
     """Extract full feature matrix for a list of entries.
 
@@ -231,6 +312,7 @@ def entries_to_features(
         entries: List of race entries
         db: Database session (required for racer history features)
         race_date: Date of the race (required for racer history features)
+        track_code: Track code for home track detection
 
     Returns (n_entries, n_features) array combining all features.
     """
@@ -257,8 +339,16 @@ def entries_to_features(
             for _ in range(n)
         ])
 
+    # Profile features (v10)
+    # Extract relative_handicap and relative_start from relative_feats for interaction
+    relative_handicap = relative_feats[:, 0]  # First column
+    relative_start = relative_feats[:, 4]     # Fifth column
+    profile_feats = compute_profile_features(
+        entries, track_code, relative_handicap, relative_start
+    )
+
     # Combine
-    return np.hstack([base_feats, relative_feats, interaction_feats, history_feats])
+    return np.hstack([base_feats, relative_feats, interaction_feats, history_feats, profile_feats])
 
 
 def build_training_data(
@@ -304,10 +394,11 @@ def build_training_data(
         if result.winner_car_no not in car_nos:
             continue
 
-        # Get race date for history lookup
+        # Get race date and track for history lookup
         race_date = race.race_day.race_date
+        track_code = race.race_day.track.track_code
 
-        features = entries_to_features(entries, db=db, race_date=race_date)
+        features = entries_to_features(entries, db=db, race_date=race_date, track_code=track_code)
         winner_idx = car_nos.index(result.winner_car_no)
 
         X_list.append(features.flatten())
@@ -362,6 +453,7 @@ def get_race_features(
 
     car_nos = [e.car_no for e in entries]
     race_date = race.race_day.race_date
-    features = entries_to_features(list(entries), db=db, race_date=race_date)
+    track_code = race.race_day.track.track_code
+    features = entries_to_features(list(entries), db=db, race_date=race_date, track_code=track_code)
 
     return car_nos, features
