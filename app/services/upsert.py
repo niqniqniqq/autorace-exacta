@@ -93,6 +93,7 @@ def upsert_entry(
         existing.deviation = entry.deviation
         existing.quinella_rate = entry.quinella_rate
         existing.trio_rate = entry.trio_rate
+        existing.start_avg = entry.start_avg
         existing.stats_json = entry.stats_json
         if snapshot_id:
             existing.snapshot_id = snapshot_id
@@ -108,6 +109,7 @@ def upsert_entry(
         deviation=entry.deviation,
         quinella_rate=entry.quinella_rate,
         trio_rate=entry.trio_rate,
+        start_avg=entry.start_avg,
         stats_json=entry.stats_json,
         snapshot_id=snapshot_id,
     )

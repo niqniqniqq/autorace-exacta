@@ -99,6 +99,7 @@ class RaceEntry(Base):
     deviation: Mapped[float | None] = mapped_column(Float)
     quinella_rate: Mapped[float | None] = mapped_column(Float)
     trio_rate: Mapped[float | None] = mapped_column(Float)
+    start_avg: Mapped[float | None] = mapped_column(Float)  # 90日間スタート平均タイム
     stats_json: Mapped[dict | None] = mapped_column(JSONB)
     snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("raw_snapshots.snapshot_id"))
 

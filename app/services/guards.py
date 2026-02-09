@@ -83,12 +83,30 @@ def guard_predict_race(
             OddsExacta.race_id == race_id, OddsExacta.captured_at == latest_captured
         )
     )
-    required_odds = entries_count * (entries_count - 1)
+
+    # Derive active entries from odds: count distinct car_nos in odds
+    # This handles absent players who are in entries but not in odds
+    active_first = db.scalars(
+        select(OddsExacta.first_car_no.distinct()).where(
+            OddsExacta.race_id == race_id, OddsExacta.captured_at == latest_captured
+        )
+    ).all()
+    active_entries_count = len(active_first) if active_first else entries_count
+
+    # Check minimum active entries
+    if active_entries_count < min_entries:
+        return PredictGuardResult(
+            ok=False,
+            reason="entries_insufficient",
+            entries_count=active_entries_count,
+        )
+
+    required_odds = active_entries_count * (active_entries_count - 1)
     if odds_count < required_odds:
         return PredictGuardResult(
             ok=False,
             reason="odds_insufficient",
-            entries_count=entries_count,
+            entries_count=active_entries_count,
             odds_count=odds_count,
             required_odds=required_odds,
             captured_at=latest_captured,
@@ -97,7 +115,7 @@ def guard_predict_race(
     return PredictGuardResult(
         ok=True,
         reason="ok",
-        entries_count=entries_count,
+        entries_count=active_entries_count,
         odds_count=odds_count,
         required_odds=required_odds,
         captured_at=latest_captured,

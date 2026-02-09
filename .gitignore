@@ -12,9 +12,6 @@ build/
 venv/
 env/
 
-data/
-models/
-*.pkl
 
 .pytest_cache/
 .mypy_cache/
