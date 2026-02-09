@@ -568,21 +568,36 @@ def backtest_exacta(
     import numpy as np
 
     from app.db.session import get_db
+    from app.db.models import Race, RaceEntry
     from app.services.backtest import get_backtest_races, run_backtest
-    from app.services.features import extract_features
-    from app.services.modeling import ExactaModel
+    from app.services.features import entries_to_features
+    from app.services.modeling_v2 import ExactaModelV2
     from app.services.modeling_v11 import ExactaModelV11, extract_v11_features
 
     # Detect model type and load accordingly
     is_v11 = ExactaModelV11.is_v11_model(model_path)
     if is_v11:
         model = ExactaModelV11.load(model_path)
-        feature_extractor = extract_v11_features
         logger.info("Using v11 LightGBM model with 8 raw features")
+
+        def feature_extractor_v11(db, race: Race, entries: list[RaceEntry]):
+            car_nos = [e.car_no for e in entries]
+            features = np.array([extract_v11_features(e) for e in entries])
+            return car_nos, features
+
+        feature_extractor = feature_extractor_v11
     else:
-        model = ExactaModel.load(model_path)
-        feature_extractor = extract_features
-        logger.info("Using v2 LogisticRegression model")
+        model = ExactaModelV2.load(model_path)
+        logger.info("Using v2 LogisticRegression model with 23 features")
+
+        def feature_extractor_v2(db, race: Race, entries: list[RaceEntry]):
+            race_date = race.race_day.race_date
+            track_code = race.race_day.track.track_code
+            car_nos = [e.car_no for e in entries]
+            features = entries_to_features(entries, db=db, race_date=race_date, track_code=track_code)
+            return car_nos, features
+
+        feature_extractor = feature_extractor_v2
 
     with get_db() as db:
         races = get_backtest_races(db)

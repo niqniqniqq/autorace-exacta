@@ -122,6 +122,22 @@ docker compose run --rm worker python -m app.cli predict:exacta --track sanyou -
   --model models/model_v11_lgb.pkl --model-version v11
 ```
 
+## バックテスト
+オッズと結果が両方揃っているレースで収益シミュレーション:
+
+```bash
+docker compose run --rm worker python -m app.cli backtest:exacta \
+  --model models/model_v11_lgb.pkl
+```
+
+出力:
+- Top-1的中率: 予測1位が的中した割合
+- EV+的中率: EV+ベットのいずれかが的中した割合
+- ROI: 回収率 (total_return / total_invested)
+- 各レースの予測 vs 実際の結果
+
+データ蓄積: `fetch:odds` と `fetch:results` を継続実行してバックテストデータを増やす
+
 ## 重要な制約
 - 公開ページのみ使用。ログイン・課金壁の回避禁止
 - 低負荷: 1-3秒ジッタ、指数バックオフ、User-Agent明示

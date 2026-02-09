@@ -58,7 +58,10 @@ class ExactaModelV11:
         if not self.is_fitted:
             n = features.shape[0]
             return np.ones(n) / n
-        return self.model.predict_proba(features)[:, 1]
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="X does not have valid feature names")
+            return self.model.predict_proba(features)[:, 1]
 
     def predict_exacta(
         self, features: np.ndarray, car_nos: list[int]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from sqlalchemy import select, distinct
@@ -86,10 +86,17 @@ def get_backtest_races(db: Session) -> list[tuple[Race, RaceResult, RaceDay, Tra
     return [(r.Race, r.RaceResult, r.RaceDay, r.Track) for r in results]
 
 
+# Type for feature extraction function: (db, race, entries) -> (car_nos, features)
+FeatureExtractorFn = Callable[
+    ["Session", Race, list[RaceEntry]],
+    tuple[list[int], np.ndarray]
+]
+
+
 def run_backtest(
     db: Session,
     model,
-    feature_extractor,
+    feature_extractor: FeatureExtractorFn,
     bet_amount: float = 100.0,
     min_odds: float = 3.0,
 ) -> BacktestSummary:
@@ -98,7 +105,7 @@ def run_backtest(
     Args:
         db: Database session
         model: Model with predict_exacta method
-        feature_extractor: Function to extract features from entries
+        feature_extractor: Function (db, race, entries) -> (car_nos, features)
         bet_amount: Amount to bet per combination
         min_odds: Minimum odds for top prediction (skip if below)
     """
@@ -129,8 +136,15 @@ def run_backtest(
             continue
 
         # Extract features and predict
-        car_nos = [e.car_no for e in entries]
-        features = np.array([feature_extractor(e) for e in entries])
+        try:
+            car_nos, features = feature_extractor(db, race, entries)
+        except Exception as e:
+            logger.warning("Feature extraction failed for race %d: %s", race.race_id, e)
+            continue
+
+        if len(car_nos) < 2:
+            continue
+
         preds = model.predict_exacta(features, car_nos)
 
         if not preds:
