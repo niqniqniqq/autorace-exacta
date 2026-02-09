@@ -408,12 +408,13 @@ def predict_exacta(
     """Generate and store exacta predictions for all races of a day."""
     from sqlalchemy import func, select
 
-    from app.db.models import OddsExacta, Race, RaceDay
+    from app.db.models import OddsExacta, Race, RaceDay, RaceEntry
     from app.db.session import get_db
     from app.scraping.http import AutoraceClient
     from app.services.guards import guard_predict_race
     from app.services.features import get_race_features
     from app.services.modeling import ExactaModel
+    from app.services.modeling_v11 import ExactaModelV11, extract_v11_features
     from app.services.upsert import upsert_prediction_exacta, upsert_race_day, upsert_track
 
     from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
@@ -440,7 +441,14 @@ def predict_exacta(
         logger.info("No active races for %s %s — nothing to predict.", track, dt)
         return
 
-    model = ExactaModel.load(model_path)
+    # Detect model type and load accordingly
+    is_v11 = ExactaModelV11.is_v11_model(model_path)
+    if is_v11:
+        model = ExactaModelV11.load(model_path)
+        logger.info("Using v11 LightGBM model with 8 raw features")
+    else:
+        model = ExactaModel.load(model_path)
+
     predicted_at = datetime.now(timezone.utc)
 
     with get_db() as db:
@@ -486,9 +494,21 @@ def predict_exacta(
                 ).all()
             )
 
-            car_nos, feats = get_race_features(db, race.race_id, active_car_nos=active_car_nos)
-            if len(car_nos) < 2:
-                continue
+            if is_v11:
+                # v11 uses raw features extracted directly from entries
+                entries = sorted(
+                    [e for e in race.entries if e.car_no in active_car_nos],
+                    key=lambda e: e.car_no
+                )
+                car_nos = [e.car_no for e in entries]
+                if len(car_nos) < 2:
+                    continue
+                import numpy as np
+                feats = np.array([extract_v11_features(e) for e in entries])
+            else:
+                car_nos, feats = get_race_features(db, race.race_id, active_car_nos=active_car_nos)
+                if len(car_nos) < 2:
+                    continue
 
             preds = model.predict_exacta(feats, car_nos)
 
