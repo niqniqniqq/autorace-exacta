@@ -59,7 +59,7 @@ alembic upgrade head                   # マイグレーション
 
 ## 特徴量
 
-### v18 特徴量 (22個, 現行最新 — レース内相対 + 非線形交互作用)
+### v18/v19/v20 特徴量 (22個, 現行最新 — レース内相対 + 非線形交互作用)
 ```
 # v17 base (16): オッズフリー
 handicap_m, trial_time, start_avg, deviation,
@@ -134,19 +134,28 @@ race_no, n_runners                            # レースコンテキスト
 
 ## モデル
 
-### 推奨: v19 (LightGBM, Isotonic Calibration + Conditional Alpha)
+### 推奨: v20 (Multi-Track LightGBM)
+```
+models/model_v20_lgb.pkl — track_codeごとに独立したv19モデル + フォールバック
+```
+- ファイル: `app/services/modeling_v20.py`
+- **設計**: 各場ごとに独立した ExactaModelV19 を学習。場の特性（外枠有利度・ハンデ効果）を個別に捉える
+- **フォールバック**: min_track_races(=100)未満の場は全場合算モデルを使用
+- **predict_exacta**: `track_code` パラメータが必要
+- 場別 alpha_map 例 (2026-04-23学習):
+  - iizuka: alpha=0.95〜1.00（モデル全信頼）
+  - kawaguchi: low=0.15（低オッズは市場優先）、high=0.70
+  - sanyou: mid=0.35（中間帯はバランス）
+- Backtest ROI: **233.7%** (全期間, min_ev=0.15) / 226.8% (2026-02以降)
+
+### v19 (LightGBM, Isotonic Calibration + Conditional Alpha)
 ```
 models/model_v19_lgb.pkl — 22特徴量 (v18同一) + Isotonic calibration + Conditional alpha
 ```
 - ファイル: `app/services/modeling_v19.py`
-- n_estimators=100, max_depth=4, num_leaves=15 (v18と同じ)
 - **Isotonic regression**: Plattシグモイドを置換、全fold OOFデータでフィット
-- **Conditional alpha**: オッズ区間別にブレンド比を最適化
-  - low(< 20倍): alpha=1.00 (モデル100%)
-  - mid(20-80倍): alpha=0.00 (市場100%)
-  - high(80-300倍): alpha=0.00 (市場100%)
-  - extreme(300+倍): alpha=1.00 (モデル100%)
-- Backtest ROI: 89.7% (flat) → **104.1% (min_ev=0.15)** → 136.5% (min_ev=0.15 + kelly=0.25)
+- **Conditional alpha**: オッズ区間別にブレンド比を最適化（low/mid/high/extreme）
+- Backtest ROI: 86.2% (min_ev=0.15, 全期間)
 
 ### v18 (LightGBM, Race-Relative + Interactions)
 ```
@@ -158,7 +167,8 @@ models/model_v18_lgb.pkl — 22特徴量 (レース内相対 + 交互作用) + P
 ### モデルバージョン一覧
 | バージョン | 特徴量数 | 主な追加要素 | model_type | ファイル |
 |-----------|---------|-------------|------------|---------|
-| **v19** | 22 | Isotonic cal + Conditional alpha | `v19_lgb` | `modeling_v19.py` |
+| **v20** | 22 | 場別独立モデル (multi-track) | `v20_lgb` | `modeling_v20.py` |
+| v19 | 22 | Isotonic cal + Conditional alpha | `v19_lgb` | `modeling_v19.py` |
 | v18 | 22 | レース内相対 + 非線形交互作用 | `v18_lgb` | `modeling_v18.py` |
 | v17 | 16 | オッズフリー (市場直交) | `v17_lgb` | `modeling_v17.py` |
 | v16 | 21 | API stats + race context | `v16_lgb` | `modeling_v16.py` |
@@ -177,7 +187,7 @@ models/model_v18_lgb.pkl — 22特徴量 (レース内相対 + 交互作用) + P
 
 ### モデル自動検出
 pickle内の `model_type` フィールドで自動判別:
-- 検出順: v19 → v18 → v17 → v16 → v15 → v14 → v13 → v12 → v11 → legacy
+- 検出順: v20 → v19 → v18 → v17 → v16 → v15 → v14 → v13 → v12 → v11 → legacy
 - predict:exacta / backtest:exacta / evaluate:exacta すべて対応
 
 ### 特徴量エンジニアリングの教訓
@@ -199,16 +209,23 @@ pickle内の `model_type` フィールドで自動判別:
 
 | 条件 | 判断 |
 |------|------|
-| トップ組合せのオッズ < 3.0 | **スキップ** (低オッズでBOX負け) |
-| EV+ (prob × odds > 1) の組合せがない | **スキップ** |
-| EV+ の組合せあり | **EV+のみ購入** |
+| EV+なし | **スキップ** |
+| 【本命帯EV+】あり | 本命帯を購入 |
+| 【穴帯EV+】あり | 穴帯を購入（リスク高・高配当狙い） |
+
+predict:exacta の出力フォーマット（v20〜）:
+```
+【本命帯EV+】 オッズ<20倍 かつ EV>0.15 をEV降順で最大3件
+【穴帯EV+】   オッズ≥20倍 かつ EV>0.15 をEV降順で最大3件
+【EV+なし/トップ3】 該当なしの場合は確率上位3件
+```
 
 ```bash
-# 予測フロー例 (v19モデル)
-docker compose run --rm worker python -m app.cli fetch:program --track sanyou --date today
-docker compose run --rm worker python -m app.cli fetch:odds --track sanyou --date today
-docker compose run --rm worker python -m app.cli predict:exacta --track sanyou --date today \
-  --model models/model_v19_lgb.pkl --model-version v19
+# 予測フロー例 (v20モデル, 試走後に再取得)
+docker compose run --rm worker python -m app.cli fetch:program --track iizuka --date today
+docker compose run --rm worker python -m app.cli fetch:odds --track iizuka --date today [--force]
+docker compose run --rm worker python -m app.cli predict:exacta --track iizuka --date today \
+  --model models/model_v20_lgb.pkl --model-version v20
 ```
 
 ## Walk-Forward 評価
@@ -267,20 +284,20 @@ docker compose run --rm worker python -m app.cli backtest:exacta \
 ## 学習コマンド
 
 ```bash
-# v19 モデル学習 (推奨, Isotonic + Conditional Alpha)
-docker compose run --rm worker python -m app.cli train:model-v19 \
-  --from 2025-06-01 --to 2026-03-25 --out models/model_v19_lgb.pkl
-
-# v18 モデル学習 (レース内相対 + 交互作用)
-docker compose run --rm worker python -m app.cli train:model-v18 \
-  --from 2025-06-01 --to 2026-03-25 --out models/model_v18_lgb.pkl
-
-# stats_json backfill (v16/v17/v18/v19 学習前に必要)
+# stats_json backfill (学習前に必要)
 docker compose run --rm worker python3 scripts/backfill_stats_json.py
+
+# v20 モデル学習 (推奨, 場別独立モデル)
+docker compose run --rm worker python -m app.cli train:model-v20 \
+  --from 2025-06-01 --to 2026-04-23 --out models/model_v20_lgb.pkl
+
+# v19 モデル学習 (単一モデル, Isotonic + Conditional Alpha)
+docker compose run --rm worker python -m app.cli train:model-v19 \
+  --from 2025-06-01 --to 2026-04-23 --out models/model_v19_lgb.pkl
 
 # バックテスト (min_ev=0.15推奨)
 docker compose run --rm worker python -m app.cli backtest:exacta \
-  --model models/model_v19_lgb.pkl --min-ev 0.15
+  --model models/model_v20_lgb.pkl --min-ev 0.15
 ```
 
 ## 重要な制約
