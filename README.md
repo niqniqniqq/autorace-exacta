@@ -1,6 +1,6 @@
 # autorace-exacta
 
-オートレース 2連単（Exacta）確率予測 MVP。川口オートレースの公開データを収集し、Plackett-Luce モデルで2連単の確率を算出する。
+オートレース 2連単（Exacta）確率予測。川口・山陽など複数場の公開データを収集し、LightGBM + Plackett-Luce モデルで2連単の確率を算出する。
 
 **kawaguchi と kawaguchi2（ナイト）は別 track として DB 上も完全に分離されます。**
 
@@ -43,16 +43,19 @@ docker compose run --rm worker python -m app.cli fetch:odds \
 docker compose run --rm worker python -m app.cli fetch:results \
   --track kawaguchi --date auto --skip-if-no-meet
 
-# 6. モデル学習
-docker compose run --rm worker python -m app.cli train:model \
-  --from 2026-01-01 --to 2026-02-14 --out models/model.pkl
+# 6. stats_json バックフィル (v16 学習前に必要、ディスクのみ)
+docker compose run --rm worker python3 scripts/backfill_stats_json.py
 
-# 7. 予測
+# 7. モデル学習 (v16 推奨)
+docker compose run --rm worker python -m app.cli train:model-v16 \
+  --from 2025-06-01 --to 2026-01-31 --out models/model_v16_lgb.pkl
+
+# 8. 予測
 docker compose run --rm worker python -m app.cli predict:exacta \
   --track kawaguchi --date auto --skip-if-no-meet \
-  --model models/model.pkl --model-version v0
+  --model models/model_v16_lgb.pkl --model-version v16
 
-# 8. API ヘルスチェック
+# 9. API ヘルスチェック
 curl http://localhost:8000/health
 ```
 
@@ -73,8 +76,17 @@ curl http://localhost:8000/health
 | `fetch:program` | 出走表を取得・格納 |
 | `fetch:odds` | 2連単オッズを取得・格納 |
 | `fetch:results` | 着順と払戻を取得・格納 |
-| `train:model` | 過去データからモデルを学習 |
-| `predict:exacta` | 予測を実行・格納 |
+| `train:model` | 過去データからモデルを学習 (legacy) |
+| `train:model-v12` | v12 モデル学習 (9特徴量, 時系列CV) |
+| `train:model-v13` | v13 モデル学習 (12特徴量 + Platt + market blend) |
+| `train:model-v14` | v14 モデル学習 (15特徴量 + Platt + market blend) |
+| `train:model-v15` | v15 モデル学習 (37特徴量, ペアワイズ) |
+| `train:model-v16` | v16 モデル学習 (21特徴量 + Platt + market blend) **推奨** |
+| `predict:exacta` | 予測を実行・格納 (モデル自動検出) |
+| `backtest:exacta` | バックテスト (全既存レース対象) |
+| `evaluate:exacta` | Walk-forward 評価 (市場ベースライン比較, v16) |
+| `backfill:stats-json` | stats_json をディスクスナップショットから充填 |
+| `recommend:purchase` | Kelly Criterion に基づく購入推奨 |
 
 ## 日付解決とスキップ動作
 
@@ -88,7 +100,7 @@ curl http://localhost:8000/health
 
 ```bash
 */5 * * * * cd /app && python -m app.cli fetch:odds --track kawaguchi --date today --skip-if-no-meet
-*/5 * * * * cd /app && python -m app.cli predict:exacta --track kawaguchi --date today --skip-if-no-meet --model models/model.pkl --model-version v0
+*/5 * * * * cd /app && python -m app.cli predict:exacta --track kawaguchi --date today --skip-if-no-meet --model models/model_v16_lgb.pkl --model-version v16
 ```
 
 ## ナイトレース (kawaguchi2) の運用例
@@ -107,7 +119,7 @@ docker compose run --rm worker python -m app.cli fetch:results \
 
 docker compose run --rm worker python -m app.cli predict:exacta \
   --track $TRACK --date 2026-02-04 --skip-if-no-meet \
-  --model models/model.pkl --model-version v0
+  --model models/model_v16_lgb.pkl --model-version v16
 ```
 
 > **注意:** `fetch:program` / `fetch:odds` / `fetch:results` / `predict:exacta` は同一 track を揃えて実行してください。kawaguchi と kawaguchi2 は別 track として DB 上も完全に分離されます。
@@ -126,12 +138,42 @@ pytest tests/ -v
 
 Plackett-Luce 風のモデル:
 
-1. 各車 i の特徴量からスコア u_i を算出（LogisticRegression）
-2. 1着確率: `p1(i) = exp(u_i) / Σ exp(u_k)`
-3. 2着確率: `p2(j|i) = exp(u_j) / Σ_{k≠i} exp(u_k)`
-4. Exacta 確率: `prob(i→j) = p1(i) × p2(j|i)`
+1. 各車 i の特徴量から勝率 p_i を算出（LightGBM）
+2. Platt calibration で確率を補正（オプション）
+3. 1着確率: `p1(i) = p_i / Σ p_k`
+4. 2着確率: `p2(j|i) = p_j / Σ_{k≠i} p_k`
+5. Exacta 確率: `prob(i→j) = p1(i) × p2(j|i)`
+6. Market blend: `P = alpha * P_model + (1-alpha) * P_market`（alpha は val data で最適化）
 
-特徴量: handicap_m, trial_time, deviation, quinella_rate, trio_rate
+### モデルバージョン
+
+| バージョン | 特徴量数 | 追加要素 | ファイル |
+|-----------|---------|---------|---------|
+| **v16 (推奨)** | 21 | v14 + API stats + race context | `modeling_v16.py` |
+| v15 | 37 (pair) | ペアワイズスコアリング | `modeling_v15.py` |
+| v14 | 15 | v13 + 選手戦績 (win_rate, place_rate, race_count) | `modeling_v14.py` |
+| v13 | 12 | v12 + オッズ由来 + Platt calibration + market blend | `modeling_v13.py` |
+| v12 | 9 | v11 + age | `modeling_v12.py` |
+| v11 | 8 | 生特徴量ベースライン | `modeling_v11.py` |
+
+### 特徴量一覧 (v16)
+```
+handicap_m, trial_time, start_avg, deviation,       # 出走表 (4)
+quinella_rate, trio_rate, rank_class, car_no,        # 出走表 (4)
+age,                                                  # 選手属性 (1)
+implied_win_prob, log_implied_win_odds, odds_rank,    # オッズ由来 (3)
+win_rate, place_rate, race_count,                     # 選手戦績90日 (3)
+good_track_trial_avg, good_track_race_avg,            # 良走路実績 (2)
+career_win_rate, career_place_rate,                   # 通算戦績 (2)
+race_no, n_runners                                    # レースコンテキスト (2)
+```
+
+### Walk-Forward 評価結果 (v16, 2025-10〜2026-01, 8 splits)
+| 指標 | Model | Baseline (市場) | Delta |
+|------|-------|----------------|-------|
+| LogLoss | 2.701 | 2.698 | +0.003 |
+| Brier | 0.8716 | 0.8703 | +0.0013 |
+| Top-1 | 22.2% | 21.9% | +0.3% |
 
 ## データ保存方針
 
@@ -159,13 +201,26 @@ autorace-exacta/
     services/
       storage.py        # スナップショット保存
       upsert.py         # Idempotent upsert
-      features.py       # 特徴量抽出
-      modeling.py       # Plackett-Luce モデル
+      features.py       # 特徴量抽出 (legacy)
+      modeling.py       # Plackett-Luce モデル (legacy)
+      modeling_v11.py   # v11 LightGBM (8特徴量)
+      modeling_v12.py   # v12 LightGBM (9特徴量)
+      modeling_v13.py   # v13 LightGBM (12特徴量 + Platt + blend)
+      modeling_v14.py   # v14 LightGBM (15特徴量 + Platt + blend)
+      modeling_v15.py   # v15 LightGBM (37特徴量, ペアワイズ)
+      modeling_v16.py   # v16 LightGBM (21特徴量 + Platt + blend)
+      training.py       # 学習パイプライン (v12〜v16, 時系列CV)
+      walkforward.py    # Walk-forward 評価エンジン
+      backtest.py       # バックテスト
+      racer_stats.py    # 選手戦績 (90日集計)
       evaluation.py     # LogLoss / Brier
+      betting.py        # Kelly Criterion 購入推奨
     api/
       main.py           # FastAPI app
       routes.py         # エンドポイント
       schemas.py        # Pydantic スキーマ
+  scripts/
+    backfill_stats_json.py  # stats_json バックフィル (ディスクから)
   tests/
   docker/
   docker-compose.yml

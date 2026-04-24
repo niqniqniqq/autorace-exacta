@@ -99,6 +99,8 @@ def run_backtest(
     feature_extractor: FeatureExtractorFn,
     bet_amount: float = 100.0,
     min_odds: float = 3.0,
+    min_ev: float = 0.0,
+    kelly_fraction: float = 0.0,
 ) -> BacktestSummary:
     """Run backtest on all available races.
 
@@ -106,8 +108,10 @@ def run_backtest(
         db: Database session
         model: Model with predict_exacta method
         feature_extractor: Function (db, race, entries) -> (car_nos, features)
-        bet_amount: Amount to bet per combination
+        bet_amount: Amount to bet per combination (flat mode)
         min_odds: Minimum odds for top prediction (skip if below)
+        min_ev: Minimum expected value threshold (e.g. 0.10 = require EV >= 1.10)
+        kelly_fraction: If > 0, use fractional Kelly sizing instead of flat bets
     """
     summary = BacktestSummary()
     races = get_backtest_races(db)
@@ -145,7 +149,37 @@ def run_backtest(
         if len(car_nos) < 2:
             continue
 
-        preds = model.predict_exacta(features, car_nos)
+        # Compute market pair probs for blend (v13+)
+        is_v20 = hasattr(model, "track_models")
+        if is_v20 or hasattr(model, "market_alpha"):
+            total_inv = sum(1.0 / o for o in odds_dict.values() if o > 0)
+            if total_inv > 0:
+                market_pair_probs = {
+                    pair: (1.0 / o) / total_inv
+                    for pair, o in odds_dict.items() if o > 0
+                }
+                if is_v20:
+                    preds = model.predict_exacta(
+                        features, car_nos,
+                        track_code=track.track_code,
+                        market_pair_probs=market_pair_probs,
+                        odds_dict=odds_dict,
+                    )
+                elif hasattr(model, "alpha_map"):
+                    preds = model.predict_exacta(
+                        features, car_nos,
+                        market_pair_probs=market_pair_probs,
+                        odds_dict=odds_dict,
+                    )
+                else:
+                    preds = model.predict_exacta(features, car_nos, market_pair_probs=market_pair_probs)
+            else:
+                if is_v20:
+                    preds = model.predict_exacta(features, car_nos, track_code=track.track_code)
+                else:
+                    preds = model.predict_exacta(features, car_nos)
+        else:
+            preds = model.predict_exacta(features, car_nos)
 
         if not preds:
             continue
@@ -162,13 +196,13 @@ def run_backtest(
         # Check top1 hit
         hit = (pred_1st == actual_1st and pred_2nd == actual_2nd)
 
-        # Find EV+ bets
+        # Find EV+ bets (with min_ev threshold)
         ev_plus_bets = []
         for first, second, prob in preds:
             odds = odds_dict.get((first, second), 0.0)
             if odds > 0:
                 ev = prob * odds - 1
-                if ev > 0:
+                if ev > min_ev:
                     ev_plus_bets.append((first, second, prob, odds))
 
         # Check if any EV+ bet hit
@@ -177,21 +211,42 @@ def run_backtest(
             for first, second, _, _ in ev_plus_bets
         )
 
-        # Calculate profit (EV+ strategy)
+        # Calculate profit (EV+ strategy with optional Kelly sizing)
         profit = 0.0
         if ev_plus_bets:
             summary.ev_plus_races += 1
-            summary.total_bets += len(ev_plus_bets)
-            summary.total_invested += bet_amount * len(ev_plus_bets)
 
-            if ev_plus_hit:
-                summary.ev_plus_hits += 1
-                # Find the winning bet's odds
-                for first, second, _, odds in ev_plus_bets:
+            if kelly_fraction > 0:
+                # Kelly bet sizing: bet_size = fraction * edge / (odds - 1)
+                race_invested = 0.0
+                race_return = 0.0
+                for first, second, prob, odds in ev_plus_bets:
+                    edge = prob * odds - 1
+                    kelly_bet = kelly_fraction * bet_amount * edge / (odds - 1) if odds > 1 else 0
+                    kelly_bet = max(kelly_bet, 0)
+                    kelly_bet = min(kelly_bet, bet_amount * 5)  # cap per bet
+                    race_invested += kelly_bet
+                    summary.total_bets += 1
                     if first == actual_1st and second == actual_2nd:
-                        profit = bet_amount * odds - bet_amount * len(ev_plus_bets)
-                        summary.total_return += bet_amount * odds
-                        break
+                        race_return = kelly_bet * odds
+
+                summary.total_invested += race_invested
+                summary.total_return += race_return
+                if ev_plus_hit:
+                    summary.ev_plus_hits += 1
+                    profit = race_return - race_invested
+            else:
+                # Flat bet sizing
+                summary.total_bets += len(ev_plus_bets)
+                summary.total_invested += bet_amount * len(ev_plus_bets)
+
+                if ev_plus_hit:
+                    summary.ev_plus_hits += 1
+                    for first, second, _, odds in ev_plus_bets:
+                        if first == actual_1st and second == actual_2nd:
+                            profit = bet_amount * odds - bet_amount * len(ev_plus_bets)
+                            summary.total_return += bet_amount * odds
+                            break
 
         # Record result
         br = BacktestResult(
