@@ -59,11 +59,60 @@ alembic upgrade head                   # マイグレーション
 
 ## 特徴量
 
-### 推奨: 生特徴量8個 (v11)
-LightGBMで非線形関係を学習させる。独自補正は不要。
+### v18 特徴量 (22個, 現行最新 — レース内相対 + 非線形交互作用)
 ```
+# v17 base (16): オッズフリー
+handicap_m, trial_time, start_avg, deviation,
+quinella_rate, trio_rate, rank_class, car_no, age,
+win_rate, place_rate, race_count,
+good_track_trial_avg, good_track_race_avg, career_win_rate, career_place_rate
+
+# レース内相対 (4): NEW
+trial_time_rel,         # trial_time - mean(全選手) → 負=場内最速寄り
+deviation_rel,          # deviation - mean(全選手) → 正=場内強い
+field_strength,         # mean(全選手のdeviation) → 高=ハイレベル戦
+trial_time_best_diff    # trial_time - min(全選手) → 0=最速
+
+# 非線形交互作用 (2): NEW
+form_delta,             # trial_time - good_track_trial_avg → 負=調子上昇
+handicap_deviation_ratio # handicap_m / (deviation + 1) → 低=能力の割にハンデ有利
+```
+仮説: 市場は個人の絶対値は織り込み済みだが、レース内の相対位置やフォーム変化は見落としがち
+
+### v17 特徴量 (16個 — オッズフリー)
+```
+# v12 base (9): 生特徴量 + 選手属性
+handicap_m, trial_time, start_avg, deviation,
+quinella_rate, trio_rate, rank_class, car_no, age
+
+# v14 追加 (3): 選手戦績 (90日)
+win_rate, place_rate, race_count
+
+# v16 API stats (4): API由来
+good_track_trial_avg, good_track_race_avg,   # latest90List
+career_win_rate, career_place_rate            # winList
+```
+除去: implied_win_prob, log_implied_win_odds, odds_rank (市場と直交するシグナルを生成するため)
+
+### v16 特徴量 (21個)
+```
+# v11 base (8): 生特徴量
 handicap_m, trial_time, start_avg, deviation,
 quinella_rate, trio_rate, rank_class, car_no
+
+# v12 追加 (1): 選手属性
+age
+
+# v13 追加 (3): オッズ由来
+implied_win_prob, log_implied_win_odds, odds_rank
+
+# v14 追加 (3): 選手戦績 (90日)
+win_rate, place_rate, race_count
+
+# v16 追加 (6): API未活用データ + レースコンテキスト
+good_track_trial_avg, good_track_race_avg,   # latest90List
+career_win_rate, career_place_rate,           # winList
+race_no, n_runners                            # レースコンテキスト
 ```
 
 ### 非推奨: 加工特徴量 (v10以前)
@@ -72,6 +121,12 @@ quinella_rate, trio_rate, rank_class, car_no
 - `adjusted_time`: 独自補正が逆効果
 - `handicap_advantage`: 正規化で情報損失
 
+### アブレーション結果 (不採用)
+| 候補 | 内容 | 結果 |
+|------|------|------|
+| race ranks | trial_time_rank, handicap_rank, deviation_rank (15→18) | LogLoss delta 変化なし (+0.002)、revert |
+| v16 API stats | good_track_*, career_*, race_no, n_runners (15→21) | LogLoss delta +0.003 (v14同等)、要ablation |
+
 ### 実データの傾向 (学習時の参考)
 - **試走1位が44%勝利** — 最重要シグナル
 - **40mハンデが最多勝(26%)** — 0mではない
@@ -79,13 +134,39 @@ quinella_rate, trio_rate, rank_class, car_no
 
 ## モデル
 
-### 推奨: v11 (LightGBM)
+### 推奨: v19 (LightGBM, Isotonic Calibration + Conditional Alpha)
 ```
-models/model_v11_lgb.pkl — 8生特徴量, 1着的中率64%
+models/model_v19_lgb.pkl — 22特徴量 (v18同一) + Isotonic calibration + Conditional alpha
 ```
-設定:
-- n_estimators=100, max_depth=4, num_leaves=15
-- min_child_samples=50, reg_alpha=1.0, reg_lambda=1.0
+- ファイル: `app/services/modeling_v19.py`
+- n_estimators=100, max_depth=4, num_leaves=15 (v18と同じ)
+- **Isotonic regression**: Plattシグモイドを置換、全fold OOFデータでフィット
+- **Conditional alpha**: オッズ区間別にブレンド比を最適化
+  - low(< 20倍): alpha=1.00 (モデル100%)
+  - mid(20-80倍): alpha=0.00 (市場100%)
+  - high(80-300倍): alpha=0.00 (市場100%)
+  - extreme(300+倍): alpha=1.00 (モデル100%)
+- Backtest ROI: 89.7% (flat) → **104.1% (min_ev=0.15)** → 136.5% (min_ev=0.15 + kelly=0.25)
+
+### v18 (LightGBM, Race-Relative + Interactions)
+```
+models/model_v18_lgb.pkl — 22特徴量 (レース内相対 + 交互作用) + Platt calibration + market blend
+```
+- v17ベース (オッズフリー16) + レース内相対4 + 非線形交互作用2 = 22特徴量
+- alpha=0.35, Backtest ROI=60.6%
+
+### モデルバージョン一覧
+| バージョン | 特徴量数 | 主な追加要素 | model_type | ファイル |
+|-----------|---------|-------------|------------|---------|
+| **v19** | 22 | Isotonic cal + Conditional alpha | `v19_lgb` | `modeling_v19.py` |
+| v18 | 22 | レース内相対 + 非線形交互作用 | `v18_lgb` | `modeling_v18.py` |
+| v17 | 16 | オッズフリー (市場直交) | `v17_lgb` | `modeling_v17.py` |
+| v16 | 21 | API stats + race context | `v16_lgb` | `modeling_v16.py` |
+| v15 | 37 (pair) | pairwise scoring | `v15_pair` | `modeling_v15.py` |
+| v14 | 15 | 選手戦績 (win_rate, place_rate, race_count) | `v14_lgb` | `modeling_v14.py` |
+| v13 | 12 | オッズ由来 + Platt + market blend | `v13_lgb` | `modeling_v13.py` |
+| v12 | 9 | age | `v12_lgb` | `modeling_v12.py` |
+| v11 | 8 | 生特徴量ベースライン | `v11_lgb` | `modeling_v11.py` |
 
 ### 非推奨 (過去バージョン)
 | モデル | 問題点 |
@@ -94,10 +175,18 @@ models/model_v11_lgb.pkl — 8生特徴量, 1着的中率64%
 | v7 (LightGBM) | 正則化不足で過学習 |
 | v2_separate | 効果不明確 |
 
+### モデル自動検出
+pickle内の `model_type` フィールドで自動判別:
+- 検出順: v19 → v18 → v17 → v16 → v15 → v14 → v13 → v12 → v11 → legacy
+- predict:exacta / backtest:exacta / evaluate:exacta すべて対応
+
 ### 特徴量エンジニアリングの教訓
 1. **生データを使う**: 相対値・正規化は多重共線性を生む
 2. **非線形はモデルに任せる**: 独自補正より木モデルの方が賢い
 3. **少ない特徴量で十分**: 8個 > 23個
+4. **保守的ハイパーパラメータ**: max_depth=4, num_leaves=15 が 15特徴量でも安定
+5. **レース内順位特徴は効かない**: LightGBMが木分割で既に相対比較を学習済み
+6. **オッズ特徴量は市場と相関**: モデル入力にオッズ→ブレンド時に同じ信号の平均→エッジゼロ。v17で除去
 
 ## 予測のベストプラクティス
 1. **発走直前にプログラム再取得** — 試走タイムは発走前に発表される
@@ -115,19 +204,56 @@ models/model_v11_lgb.pkl — 8生特徴量, 1着的中率64%
 | EV+ の組合せあり | **EV+のみ購入** |
 
 ```bash
-# 予測フロー例 (v11モデル)
+# 予測フロー例 (v19モデル)
 docker compose run --rm worker python -m app.cli fetch:program --track sanyou --date today
 docker compose run --rm worker python -m app.cli fetch:odds --track sanyou --date today
 docker compose run --rm worker python -m app.cli predict:exacta --track sanyou --date today \
-  --model models/model_v11_lgb.pkl --model-version v11
+  --model models/model_v19_lgb.pkl --model-version v19
 ```
+
+## Walk-Forward 評価
+ローリングウィンドウで学習→検証→テストを繰り返し、市場ベースラインと比較:
+
+```bash
+# v18 (デフォルト)
+docker compose run --rm worker python3 -m app.cli evaluate:exacta \
+  --from 2025-10-01 --to 2026-01-31 --train-days 60 --test-days 7
+
+# v17
+docker compose run --rm worker python3 -m app.cli evaluate:exacta \
+  --from 2025-10-01 --to 2026-01-31 --train-days 60 --test-days 7 --version v17
+
+# v16
+docker compose run --rm worker python3 -m app.cli evaluate:exacta \
+  --from 2025-10-01 --to 2026-01-31 --train-days 60 --test-days 7 --version v16
+```
+
+出力指標:
+- **LogLoss**: ペアレベルの対数損失 (市場ベースラインとの差分)
+- **Brier**: ペアレベルのBrierスコア
+- **Top-1**: 予測1位が的中した割合
+
+### 最新 Walk-Forward 結果 (v16, 2025-10〜2026-01, 8 splits)
+| 指標 | Model | Baseline | Delta |
+|------|-------|----------|-------|
+| LogLoss | 2.701 | 2.698 | +0.003 |
+| Brier | 0.8716 | 0.8703 | +0.0013 |
+| Top-1 | 22.2% | 21.9% | +0.3% |
+
+市場ベースラインとほぼ同等。market_alpha は 0.00〜0.10 で推移し、モデル独自シグナルはまだ弱い。
+
+### 過去 Walk-Forward 結果
+| モデル | LogLoss (Model) | LogLoss (Baseline) | Delta |
+|--------|----------------|-------------------|-------|
+| v16 (21特徴量) | 2.701 | 2.698 | +0.003 |
+| v14 (15特徴量) | 2.699 | 2.698 | +0.002 |
 
 ## バックテスト
 オッズと結果が両方揃っているレースで収益シミュレーション:
 
 ```bash
 docker compose run --rm worker python -m app.cli backtest:exacta \
-  --model models/model_v11_lgb.pkl
+  --model models/model_v16_lgb.pkl
 ```
 
 出力:
@@ -137,6 +263,25 @@ docker compose run --rm worker python -m app.cli backtest:exacta \
 - 各レースの予測 vs 実際の結果
 
 データ蓄積: `fetch:odds` と `fetch:results` を継続実行してバックテストデータを増やす
+
+## 学習コマンド
+
+```bash
+# v19 モデル学習 (推奨, Isotonic + Conditional Alpha)
+docker compose run --rm worker python -m app.cli train:model-v19 \
+  --from 2025-06-01 --to 2026-03-25 --out models/model_v19_lgb.pkl
+
+# v18 モデル学習 (レース内相対 + 交互作用)
+docker compose run --rm worker python -m app.cli train:model-v18 \
+  --from 2025-06-01 --to 2026-03-25 --out models/model_v18_lgb.pkl
+
+# stats_json backfill (v16/v17/v18/v19 学習前に必要)
+docker compose run --rm worker python3 scripts/backfill_stats_json.py
+
+# バックテスト (min_ev=0.15推奨)
+docker compose run --rm worker python -m app.cli backtest:exacta \
+  --model models/model_v19_lgb.pkl --min-ev 0.15
+```
 
 ## 重要な制約
 - 公開ページのみ使用。ログイン・課金壁の回避禁止

@@ -148,6 +148,7 @@ def fetch_odds_cmd(
     skip_if_no_meet: bool = typer.Option(
         True, "--skip-if-no-meet/--no-skip-if-no-meet", help="Skip if no meet"
     ),
+    force: bool = typer.Option(False, "--force", help="Skip freshness check"),
 ) -> None:
     """Fetch and store exacta odds."""
     from app.db.session import get_db
@@ -179,7 +180,7 @@ def fetch_odds_cmd(
 
     dt = race_date.isoformat()
     with get_db() as db:
-        if has_fresh_odds(db, track, race_date):
+        if not force and has_fresh_odds(db, track, race_date):
             logger.info(
                 "Skip fetch:odds (already fresh within 3 minutes) track=%s date=%s",
                 track,
@@ -479,6 +480,14 @@ def predict_exacta(
     from app.services.modeling import ExactaModel
     from app.services.modeling_v11 import ExactaModelV11, extract_v11_features
     from app.services.modeling_v12 import ExactaModelV12, extract_v12_features
+    from app.services.modeling_v13 import ExactaModelV13, extract_v13_features, compute_runner_odds_stats
+    from app.services.modeling_v14 import ExactaModelV14, extract_v14_features
+    from app.services.modeling_v15 import ExactaModelV15
+    from app.services.modeling_v16 import ExactaModelV16, extract_v16_features
+    from app.services.modeling_v17 import ExactaModelV17, extract_v17_features
+    from app.services.modeling_v18 import ExactaModelV18, extract_v18_features, compute_race_context
+    from app.services.modeling_v19 import ExactaModelV19
+    from app.services.modeling_v20 import ExactaModelV20
     from app.services.upsert import upsert_prediction_exacta, upsert_race_day, upsert_track
 
     from app.services.date_resolver import is_date_keyword, resolve_date_with_reason
@@ -505,12 +514,44 @@ def predict_exacta(
         logger.info("No active races for %s %s — nothing to predict.", track, dt)
         return
 
-    # Detect model type and load accordingly
-    is_v12 = ExactaModelV12.is_v12_model(model_path)
-    is_v11 = not is_v12 and ExactaModelV11.is_v11_model(model_path)
-    if is_v12:
+    # Detect model type (v20 → v19 → v18 → v17 → v16 → v15 → v14 → v13 → v12 → v11 → legacy)
+    is_v20 = ExactaModelV20.is_v20_model(model_path)
+    is_v19 = not is_v20 and ExactaModelV19.is_v19_model(model_path)
+    is_v18 = not is_v20 and not is_v19 and ExactaModelV18.is_v18_model(model_path)
+    is_v17 = not is_v20 and not is_v19 and not is_v18 and ExactaModelV17.is_v17_model(model_path)
+    is_v16 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and ExactaModelV16.is_v16_model(model_path)
+    is_v15 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and ExactaModelV15.is_v15_model(model_path)
+    is_v14 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and ExactaModelV14.is_v14_model(model_path)
+    is_v13 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and not is_v14 and ExactaModelV13.is_v13_model(model_path)
+    is_v12 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and not is_v14 and not is_v13 and ExactaModelV12.is_v12_model(model_path)
+    is_v11 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and not is_v14 and not is_v13 and not is_v12 and ExactaModelV11.is_v11_model(model_path)
+    if is_v20:
+        model = ExactaModelV20.load(model_path)
+        logger.info("Using v20 multi-track LightGBM model (track=%s)", track)
+    elif is_v19:
+        model = ExactaModelV19.load(model_path)
+        logger.info("Using v19 LightGBM model with 22 features (isotonic + conditional alpha)")
+    elif is_v18:
+        model = ExactaModelV18.load(model_path)
+        logger.info("Using v18 LightGBM model with 22 features (race-relative + interactions)")
+    elif is_v17:
+        model = ExactaModelV17.load(model_path)
+        logger.info("Using v17 LightGBM model with 16 features (odds-free)")
+    elif is_v16:
+        model = ExactaModelV16.load(model_path)
+        logger.info("Using v16 LightGBM model with 19 features (API stats)")
+    elif is_v15:
+        model = ExactaModelV15.load(model_path)
+        logger.info("Using v15 pairwise model with 37 pair features")
+    elif is_v14:
+        model = ExactaModelV14.load(model_path)
+        logger.info("Using v14 LightGBM model with 15 features (racer history)")
+    elif is_v13:
+        model = ExactaModelV13.load(model_path)
+        logger.info("Using v13 LightGBM model with 12 features (odds + calibration)")
+    elif is_v12:
         model = ExactaModelV12.load(model_path)
-        logger.info("Using v12 LightGBM model with 14 features")
+        logger.info("Using v12 LightGBM model with 9 features")
     elif is_v11:
         model = ExactaModelV11.load(model_path)
         logger.info("Using v11 LightGBM model with 8 raw features")
@@ -562,7 +603,96 @@ def predict_exacta(
                 ).all()
             )
 
-            if is_v12 or is_v11:
+            if is_v20 or is_v19 or is_v18:
+                import numpy as np
+                from app.services.racer_stats import get_racer_stats
+                entries = sorted(
+                    [e for e in race.entries if e.car_no in active_car_nos],
+                    key=lambda e: e.car_no,
+                )
+                car_nos = [e.car_no for e in entries]
+                if len(car_nos) < 2:
+                    continue
+                odds_rows = db.scalars(
+                    select(OddsExacta).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+                odds_dict = {(o.first_car_no, o.second_car_no): o.odds for o in odds_rows}
+                race_ctx = compute_race_context(entries)
+                feats = np.array([
+                    extract_v18_features(
+                        e,
+                        racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                        race_context=race_ctx,
+                    )
+                    for e in entries
+                ])
+            elif is_v17:
+                import numpy as np
+                from app.services.racer_stats import get_racer_stats
+                entries = sorted(
+                    [e for e in race.entries if e.car_no in active_car_nos],
+                    key=lambda e: e.car_no,
+                )
+                car_nos = [e.car_no for e in entries]
+                if len(car_nos) < 2:
+                    continue
+                # v17: no odds features needed, but we need odds_dict for market blend
+                odds_rows = db.scalars(
+                    select(OddsExacta).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+                odds_dict = {(o.first_car_no, o.second_car_no): o.odds for o in odds_rows}
+                feats = np.array([
+                    extract_v17_features(
+                        e,
+                        racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                    )
+                    for e in entries
+                ])
+            elif is_v16 or is_v15 or is_v14 or is_v13:
+                import numpy as np
+                entries = sorted(
+                    [e for e in race.entries if e.car_no in active_car_nos],
+                    key=lambda e: e.car_no,
+                )
+                car_nos = [e.car_no for e in entries]
+                if len(car_nos) < 2:
+                    continue
+                # Get odds for v13+ features
+                odds_rows = db.scalars(
+                    select(OddsExacta).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+                odds_dict = {(o.first_car_no, o.second_car_no): o.odds for o in odds_rows}
+                odds_stats = compute_runner_odds_stats(odds_dict, car_nos)
+                if is_v16:
+                    from app.services.racer_stats import get_racer_stats
+                    feats = np.array([
+                        extract_v16_features(
+                            e, odds_stats,
+                            racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                        )
+                        for e in entries
+                    ])
+                elif is_v15 or is_v14:
+                    from app.services.racer_stats import get_racer_stats
+                    feats = np.array([
+                        extract_v14_features(
+                            e, odds_stats,
+                            racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                        )
+                        for e in entries
+                    ])
+                else:
+                    feats = np.array([extract_v13_features(e, odds_stats) for e in entries])
+            elif is_v12 or is_v11:
                 import numpy as np
                 entries = sorted(
                     [e for e in race.entries if e.car_no in active_car_nos],
@@ -580,7 +710,28 @@ def predict_exacta(
                 if len(car_nos) < 2:
                     continue
 
-            preds = model.predict_exacta(feats, car_nos)
+            # Pass market pair probs for v13+ blend
+            market_pair_probs = None
+            if (is_v20 or is_v19 or is_v18 or is_v17 or is_v16 or is_v15 or is_v14 or is_v13) and (is_v20 or hasattr(model, "market_alpha")):
+                total_inv = sum(1.0 / o for o in odds_dict.values() if o > 0)
+                if total_inv > 0:
+                    market_pair_probs = {
+                        pair: (1.0 / o) / total_inv
+                        for pair, o in odds_dict.items() if o > 0
+                    }
+
+            if market_pair_probs is not None:
+                if is_v20:
+                    preds = model.predict_exacta(feats, car_nos, track_code=track, market_pair_probs=market_pair_probs, odds_dict=odds_dict)
+                elif is_v19:
+                    preds = model.predict_exacta(feats, car_nos, market_pair_probs=market_pair_probs, odds_dict=odds_dict)
+                else:
+                    preds = model.predict_exacta(feats, car_nos, market_pair_probs=market_pair_probs)
+            else:
+                if is_v20:
+                    preds = model.predict_exacta(feats, car_nos, track_code=track)
+                else:
+                    preds = model.predict_exacta(feats, car_nos)
 
             latest_odds: dict[tuple[int, int], float] = {}
             odds_rows = (
@@ -598,6 +749,9 @@ def predict_exacta(
                     latest_odds[key] = o.odds
 
             typer.echo(f"\n=== R{race.race_no} ===")
+
+            # Upsert all predictions and collect EV data
+            all_ev: list[tuple[int, int, float, float, float]] = []  # (1st,2nd,prob,mkt,ev)
             for first, second, prob in preds[:top]:
                 fair = 1.0 / prob if prob > 0 else float("inf")
                 mkt = latest_odds.get((first, second))
@@ -616,11 +770,36 @@ def predict_exacta(
                     ev=ev,
                 )
 
-                ev_str = f"  EV={ev:+.3f}" if ev is not None else ""
-                mkt_str = f"  mkt={mkt:.1f}" if mkt is not None else ""
-                typer.echo(
-                    f"  {first}-{second}  prob={prob:.4f}  fair={fair:.1f}{mkt_str}{ev_str}"
-                )
+                if ev is not None and mkt is not None:
+                    all_ev.append((first, second, prob, mkt, ev))
+
+            # --- EV+ display: split by odds bracket ---
+            min_ev_display = 0.15
+            ev_low  = [(f,s,p,m,e) for f,s,p,m,e in all_ev if m <  20 and e > min_ev_display]
+            ev_high = [(f,s,p,m,e) for f,s,p,m,e in all_ev if m >= 20 and e > min_ev_display]
+            ev_low.sort(key=lambda x: -x[4])   # sort by EV desc
+            ev_high.sort(key=lambda x: -x[4])
+
+            has_ev = ev_low or ev_high
+            if has_ev:
+                if ev_low:
+                    typer.echo("  【本命帯EV+】")
+                    for f,s,p,m,e in ev_low[:3]:
+                        typer.echo(f"    {f}-{s}  prob={p:.3f}  mkt={m:.1f}x  EV={e:+.2f}")
+                if ev_high:
+                    typer.echo("  【穴帯EV+】")
+                    for f,s,p,m,e in ev_high[:3]:
+                        typer.echo(f"    {f}-{s}  prob={p:.3f}  mkt={m:.1f}x  EV={e:+.2f}")
+            else:
+                # No EV+ bets: show top 3 by probability
+                typer.echo("  【EV+なし / トップ3】")
+                for first, second, prob in preds[:3]:
+                    mkt = latest_odds.get((first, second))
+                    fair = 1.0 / prob if prob > 0 else float("inf")
+                    ev = (prob * mkt - 1) if mkt else None
+                    ev_str = f"  EV={ev:+.2f}" if ev is not None else ""
+                    mkt_str = f"  mkt={mkt:.1f}x" if mkt is not None else ""
+                    typer.echo(f"    {first}-{second}  prob={prob:.3f}  fair={fair:.1f}{mkt_str}{ev_str}")
 
         typer.echo(f"\nPredictions saved ({model_version})")
 
@@ -633,23 +812,215 @@ def backtest_exacta(
     model_path: str = typer.Option(..., "--model", help="Path to model .pkl"),
     bet_amount: float = typer.Option(100.0, "--bet", help="Bet amount per combination"),
     min_odds: float = typer.Option(3.0, "--min-odds", help="Minimum odds for top prediction"),
+    min_ev: float = typer.Option(0.0, "--min-ev", help="Minimum EV threshold (e.g. 0.10)"),
+    kelly: float = typer.Option(0.0, "--kelly", help="Kelly fraction (0=flat, 0.25=quarter-Kelly)"),
 ) -> None:
     """Run backtest on races with both odds and results."""
     import numpy as np
+    from sqlalchemy import func, select as sa_select
 
     from app.db.session import get_db
-    from app.db.models import Race, RaceEntry
+    from app.db.models import OddsExacta, Race, RaceEntry
     from app.services.backtest import get_backtest_races, run_backtest
     from app.services.features import entries_to_features
     from app.services.modeling_v2 import ExactaModelV2
     from app.services.modeling_v11 import ExactaModelV11, extract_v11_features
     from app.services.modeling_v12 import ExactaModelV12, extract_v12_features
+    from app.services.modeling_v13 import ExactaModelV13, extract_v13_features, compute_runner_odds_stats
+    from app.services.modeling_v14 import ExactaModelV14, extract_v14_features
+    from app.services.modeling_v15 import ExactaModelV15
+    from app.services.modeling_v16 import ExactaModelV16, extract_v16_features
+    from app.services.modeling_v17 import ExactaModelV17, extract_v17_features
+    from app.services.modeling_v18 import ExactaModelV18, extract_v18_features, compute_race_context
+    from app.services.modeling_v19 import ExactaModelV19
+    from app.services.modeling_v20 import ExactaModelV20
 
-    # Detect model type and load accordingly
-    is_v12 = ExactaModelV12.is_v12_model(model_path)
-    is_v11 = not is_v12 and ExactaModelV11.is_v11_model(model_path)
+    # Detect model type (v20 → v19 → v18 → v17 → v16 → v15 → v14 → v13 → v12 → v11 → legacy)
+    is_v20 = ExactaModelV20.is_v20_model(model_path)
+    is_v19 = not is_v20 and ExactaModelV19.is_v19_model(model_path)
+    is_v18 = not is_v20 and not is_v19 and ExactaModelV18.is_v18_model(model_path)
+    is_v17 = not is_v20 and not is_v19 and not is_v18 and ExactaModelV17.is_v17_model(model_path)
+    is_v16 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and ExactaModelV16.is_v16_model(model_path)
+    is_v15 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and ExactaModelV15.is_v15_model(model_path)
+    is_v14 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and ExactaModelV14.is_v14_model(model_path)
+    is_v13 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and not is_v14 and ExactaModelV13.is_v13_model(model_path)
+    is_v12 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and not is_v14 and not is_v13 and ExactaModelV12.is_v12_model(model_path)
+    is_v11 = not is_v20 and not is_v19 and not is_v18 and not is_v17 and not is_v16 and not is_v15 and not is_v14 and not is_v13 and not is_v12 and ExactaModelV11.is_v11_model(model_path)
 
-    if is_v12:
+    if is_v20 or is_v19 or is_v18:
+        if is_v20:
+            model = ExactaModelV20.load(model_path)
+            logger.info("Using v20 multi-track LightGBM model")
+        elif is_v19:
+            model = ExactaModelV19.load(model_path)
+            logger.info("Using v19 LightGBM model with 22 features (isotonic + conditional alpha)")
+        else:
+            model = ExactaModelV18.load(model_path)
+            logger.info("Using v18 LightGBM model with 22 features (race-relative + interactions)")
+
+        def feature_extractor_v18(db, race: Race, entries: list[RaceEntry]):
+            from app.services.racer_stats import get_racer_stats
+            car_nos = [e.car_no for e in entries]
+            race_date = race.race_day.race_date
+            race_ctx = compute_race_context(entries)
+            feats = np.array([
+                extract_v18_features(
+                    e,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                    race_context=race_ctx,
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        feature_extractor = feature_extractor_v18
+    elif is_v17:
+        model = ExactaModelV17.load(model_path)
+        logger.info("Using v17 LightGBM model with 16 features (odds-free)")
+
+        def feature_extractor_v17(db, race: Race, entries: list[RaceEntry]):
+            from app.services.racer_stats import get_racer_stats
+            car_nos = [e.car_no for e in entries]
+            race_date = race.race_day.race_date
+            feats = np.array([
+                extract_v17_features(
+                    e,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        feature_extractor = feature_extractor_v17
+    elif is_v16:
+        model = ExactaModelV16.load(model_path)
+        logger.info("Using v16 LightGBM model with 19 features (API stats)")
+
+        def feature_extractor_v16(db, race: Race, entries: list[RaceEntry]):
+            from app.services.racer_stats import get_racer_stats
+            car_nos = [e.car_no for e in entries]
+            latest_captured = db.scalar(
+                sa_select(func.max(OddsExacta.captured_at)).where(
+                    OddsExacta.race_id == race.race_id
+                )
+            )
+            if latest_captured:
+                odds_rows = db.scalars(
+                    sa_select(OddsExacta).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+                odds_dict = {(o.first_car_no, o.second_car_no): o.odds for o in odds_rows}
+            else:
+                odds_dict = {}
+            odds_stats = compute_runner_odds_stats(odds_dict, car_nos)
+            race_date = race.race_day.race_date
+            feats = np.array([
+                extract_v16_features(
+                    e, odds_stats,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        feature_extractor = feature_extractor_v16
+    elif is_v15:
+        model = ExactaModelV15.load(model_path)
+        logger.info("Using v15 pairwise model with 37 pair features")
+
+        def feature_extractor_v15(db, race: Race, entries: list[RaceEntry]):
+            from app.services.racer_stats import get_racer_stats
+            car_nos = [e.car_no for e in entries]
+            latest_captured = db.scalar(
+                sa_select(func.max(OddsExacta.captured_at)).where(
+                    OddsExacta.race_id == race.race_id
+                )
+            )
+            if latest_captured:
+                odds_rows = db.scalars(
+                    sa_select(OddsExacta).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+                odds_dict = {(o.first_car_no, o.second_car_no): o.odds for o in odds_rows}
+            else:
+                odds_dict = {}
+            odds_stats = compute_runner_odds_stats(odds_dict, car_nos)
+            race_date = race.race_day.race_date
+            feats = np.array([
+                extract_v14_features(
+                    e, odds_stats,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        feature_extractor = feature_extractor_v15
+    elif is_v14:
+        model = ExactaModelV14.load(model_path)
+        logger.info("Using v14 LightGBM model with 15 features (racer history)")
+
+        def feature_extractor_v14(db, race: Race, entries: list[RaceEntry]):
+            from app.services.racer_stats import get_racer_stats
+            car_nos = [e.car_no for e in entries]
+            latest_captured = db.scalar(
+                sa_select(func.max(OddsExacta.captured_at)).where(
+                    OddsExacta.race_id == race.race_id
+                )
+            )
+            if latest_captured:
+                odds_rows = db.scalars(
+                    sa_select(OddsExacta).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+                odds_dict = {(o.first_car_no, o.second_car_no): o.odds for o in odds_rows}
+            else:
+                odds_dict = {}
+            odds_stats = compute_runner_odds_stats(odds_dict, car_nos)
+            race_date = race.race_day.race_date
+            feats = np.array([
+                extract_v14_features(
+                    e, odds_stats,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        feature_extractor = feature_extractor_v14
+    elif is_v13:
+        model = ExactaModelV13.load(model_path)
+        logger.info("Using v13 LightGBM model with 12 features (odds + calibration)")
+
+        def feature_extractor_v13(db, race: Race, entries: list[RaceEntry]):
+            car_nos = [e.car_no for e in entries]
+            latest_captured = db.scalar(
+                sa_select(func.max(OddsExacta.captured_at)).where(
+                    OddsExacta.race_id == race.race_id
+                )
+            )
+            if latest_captured:
+                odds_rows = db.scalars(
+                    sa_select(OddsExacta).where(
+                        OddsExacta.race_id == race.race_id,
+                        OddsExacta.captured_at == latest_captured,
+                    )
+                ).all()
+                odds_dict = {(o.first_car_no, o.second_car_no): o.odds for o in odds_rows}
+            else:
+                odds_dict = {}
+            odds_stats = compute_runner_odds_stats(odds_dict, car_nos)
+            feats = np.array([extract_v13_features(e, odds_stats) for e in entries])
+            return car_nos, feats
+
+        feature_extractor = feature_extractor_v13
+    elif is_v12:
         model = ExactaModelV12.load(model_path)
         logger.info("Using v12 LightGBM model with 9 features")
 
@@ -691,7 +1062,9 @@ def backtest_exacta(
         typer.echo(f"Found {len(races)} races for backtest")
 
         summary = run_backtest(
-            db, model, feature_extractor, bet_amount=bet_amount, min_odds=min_odds
+            db, model, feature_extractor,
+            bet_amount=bet_amount, min_odds=min_odds,
+            min_ev=min_ev, kelly_fraction=kelly,
         )
 
         # Display summary
@@ -716,6 +1089,807 @@ def backtest_exacta(
                 f"pred={r.pred_1st}-{r.pred_2nd} actual={r.actual_1st}-{r.actual_2nd} "
                 f"[{hit_mark}] [{ev_mark}] profit=¥{r.profit:+,.0f}"
             )
+
+
+# ---------------------------------------------------------------
+# train:model-v13
+# ---------------------------------------------------------------
+@app.command("train:model-v13")
+def train_model_v13(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v13_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Fit Platt calibration"),
+) -> None:
+    """Train v13 LightGBM model with odds features + Platt calibration."""
+    from app.db.session import get_db
+    from app.services.training import train_v13_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v13_model(
+            db, d_from, d_to, n_folds=n_folds, calibrate=calibrate
+        )
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v13 Training Report ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances
+        typer.echo(f"\n--- Feature Importances ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>25s}: {imp:4d} {bar}")
+
+        # Calibration info
+        if hasattr(model, "calibrator") and model.calibrator:
+            a, b = model.calibrator
+            typer.echo(f"\n--- Platt Calibration ---")
+            typer.echo(f"  a={a:.4f}, b={b:.4f}")
+
+        # Market blend info
+        if hasattr(model, "market_alpha") and model.market_alpha > 0:
+            typer.echo(f"\n--- Market Blend ---")
+            typer.echo(f"  alpha={model.market_alpha:.2f} ({model.market_alpha:.0%} model + {1-model.market_alpha:.0%} market)")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v13",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# train:model-v14
+# ---------------------------------------------------------------
+@app.command("train:model-v14")
+def train_model_v14(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v14_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Fit Platt calibration"),
+) -> None:
+    """Train v14 LightGBM model with racer history + home track + Platt calibration."""
+    from app.db.session import get_db
+    from app.services.training import train_v14_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v14_model(
+            db, d_from, d_to, n_folds=n_folds, calibrate=calibrate
+        )
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v14 Training Report ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances
+        typer.echo(f"\n--- Feature Importances ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>25s}: {imp:4d} {bar}")
+
+        # Calibration info
+        if hasattr(model, "calibrator") and model.calibrator:
+            a, b = model.calibrator
+            typer.echo(f"\n--- Platt Calibration ---")
+            typer.echo(f"  a={a:.4f}, b={b:.4f}")
+
+        # Market blend info
+        if hasattr(model, "market_alpha") and model.market_alpha > 0:
+            typer.echo(f"\n--- Market Blend ---")
+            typer.echo(f"  alpha={model.market_alpha:.2f} ({model.market_alpha:.0%} model + {1-model.market_alpha:.0%} market)")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v14",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# train:model-v15
+# ---------------------------------------------------------------
+@app.command("train:model-v15")
+def train_model_v15(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v15_pair.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+) -> None:
+    """Train v15 pairwise model (direct pair scoring, no Plackett-Luce)."""
+    from app.db.session import get_db
+    from app.services.training import train_v15_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v15_model(db, d_from, d_to, n_folds=n_folds)
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v15 Training Report (Pairwise) ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} pair samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances (top 20)
+        typer.echo(f"\n--- Feature Importances (top 20) ---")
+        for name, imp in report.feature_importances[:20]:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>30s}: {imp:4d} {bar}")
+
+        # Market blend info
+        if hasattr(model, "market_alpha") and model.market_alpha > 0:
+            typer.echo(f"\n--- Market Blend ---")
+            typer.echo(f"  alpha={model.market_alpha:.2f} ({model.market_alpha:.0%} model + {1-model.market_alpha:.0%} market)")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v15",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# train:model-v16
+# ---------------------------------------------------------------
+@app.command("train:model-v16")
+def train_model_v16(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v16_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Fit Platt calibration"),
+) -> None:
+    """Train v16 LightGBM model with API stats + race context + Platt calibration."""
+    from app.db.session import get_db
+    from app.services.training import train_v16_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v16_model(
+            db, d_from, d_to, n_folds=n_folds, calibrate=calibrate
+        )
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v16 Training Report ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances
+        typer.echo(f"\n--- Feature Importances ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>25s}: {imp:4d} {bar}")
+
+        # Calibration info
+        if hasattr(model, "calibrator") and model.calibrator:
+            a, b = model.calibrator
+            typer.echo(f"\n--- Platt Calibration ---")
+            typer.echo(f"  a={a:.4f}, b={b:.4f}")
+
+        # Market blend info
+        if hasattr(model, "market_alpha") and model.market_alpha > 0:
+            typer.echo(f"\n--- Market Blend ---")
+            typer.echo(f"  alpha={model.market_alpha:.2f} ({model.market_alpha:.0%} model + {1-model.market_alpha:.0%} market)")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v16",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# train:model-v17
+# ---------------------------------------------------------------
+@app.command("train:model-v17")
+def train_model_v17(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v17_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Fit Platt calibration"),
+) -> None:
+    """Train v17 odds-free LightGBM model + Platt calibration + market blend."""
+    from app.db.session import get_db
+    from app.services.training import train_v17_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v17_model(
+            db, d_from, d_to, n_folds=n_folds, calibrate=calibrate
+        )
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v17 Training Report (Odds-Free) ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances
+        typer.echo(f"\n--- Feature Importances ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>25s}: {imp:4d} {bar}")
+
+        # Calibration info
+        if hasattr(model, "calibrator") and model.calibrator:
+            a, b = model.calibrator
+            typer.echo(f"\n--- Platt Calibration ---")
+            typer.echo(f"  a={a:.4f}, b={b:.4f}")
+
+        # Market blend info
+        if hasattr(model, "market_alpha"):
+            typer.echo(f"\n--- Market Blend ---")
+            typer.echo(f"  alpha={model.market_alpha:.2f} ({model.market_alpha:.0%} model + {1-model.market_alpha:.0%} market)")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v17",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# train:model-v18
+# ---------------------------------------------------------------
+@app.command("train:model-v18")
+def train_model_v18(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v18_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Fit Platt calibration"),
+) -> None:
+    """Train v18 LightGBM model with race-relative features + interactions + Platt calibration."""
+    from app.db.session import get_db
+    from app.services.training import train_v18_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v18_model(
+            db, d_from, d_to, n_folds=n_folds, calibrate=calibrate
+        )
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v18 Training Report (Race-Relative + Interactions) ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances
+        typer.echo(f"\n--- Feature Importances ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>30s}: {imp:4d} {bar}")
+
+        # Calibration info
+        if hasattr(model, "calibrator") and model.calibrator:
+            a, b = model.calibrator
+            typer.echo(f"\n--- Platt Calibration ---")
+            typer.echo(f"  a={a:.4f}, b={b:.4f}")
+
+        # Market blend info
+        if hasattr(model, "market_alpha"):
+            typer.echo(f"\n--- Market Blend ---")
+            typer.echo(f"  alpha={model.market_alpha:.2f} ({model.market_alpha:.0%} model + {1-model.market_alpha:.0%} market)")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v18",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# train:model-v19
+# ---------------------------------------------------------------
+@app.command("train:model-v19")
+def train_model_v19(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v19_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Fit isotonic calibration"),
+) -> None:
+    """Train v19 LightGBM model with isotonic calibration + conditional alpha."""
+    from app.db.session import get_db
+    from app.services.training import train_v19_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v19_model(
+            db, d_from, d_to, n_folds=n_folds, calibrate=calibrate
+        )
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        # Display CV results
+        typer.echo(f"\n=== v19 Training Report (Isotonic Cal + Conditional Alpha) ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"\n--- Cross-Validation ({len(report.fold_results)} folds) ---")
+        for fr in report.fold_results:
+            typer.echo(
+                f"  Fold {fr.fold}: train={fr.train_size} val={fr.val_size}"
+                f" ({fr.val_races} races) logloss={fr.logloss:.4f}"
+                f" top1={fr.top1_accuracy:.1%}"
+            )
+        typer.echo(f"\n  CV Mean LogLoss: {report.cv_mean_logloss:.4f}")
+        typer.echo(f"  CV Mean Top-1:   {report.cv_mean_top1:.1%}")
+
+        # Feature importances
+        typer.echo(f"\n--- Feature Importances ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>30s}: {imp:4d} {bar}")
+
+        # Calibration info
+        if hasattr(model, "_isotonic") and model._isotonic is not None:
+            typer.echo(f"\n--- Isotonic Calibration ---")
+            typer.echo(f"  Fitted (nonparametric)")
+
+        # Market blend info
+        if hasattr(model, "market_alpha"):
+            typer.echo(f"\n--- Market Blend ---")
+            typer.echo(f"  Global alpha={model.market_alpha:.2f}")
+        if hasattr(model, "alpha_map") and model.alpha_map:
+            typer.echo(f"\n--- Conditional Alpha (by odds bucket) ---")
+            for bucket, alpha in model.alpha_map.items():
+                typer.echo(f"  {bucket:>8s}: alpha={alpha:.2f}")
+
+        # Save model
+        model.save(out)
+
+        # Record in model_runs
+        upsert_model_run(
+            db,
+            model_version="v19",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# train:model-v20
+# ---------------------------------------------------------------
+@app.command("train:model-v20")
+def train_model_v20(
+    from_date: str = typer.Option(..., "--from", help="Train start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Train end date YYYY-MM-DD"),
+    out: str = typer.Option("models/model_v20_lgb.pkl", "--out", help="Output model path"),
+    n_folds: int = typer.Option(5, "--folds", help="Number of CV folds"),
+    min_track_races: int = typer.Option(100, "--min-track-races", help="Min races to train per-track model"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Fit isotonic calibration"),
+) -> None:
+    """Train v20 multi-track LightGBM model (one model per track_code)."""
+    from app.db.session import get_db
+    from app.services.training import train_v20_model
+    from app.services.upsert import upsert_model_run
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    with get_db() as db:
+        model, report = train_v20_model(
+            db, d_from, d_to, n_folds=n_folds,
+            calibrate=calibrate, min_track_races=min_track_races,
+        )
+
+        if report.total_samples == 0:
+            typer.echo("No training data found. Saving unfitted model.")
+            model.save(out)
+            return
+
+        typer.echo(f"\n=== v20 Training Report (Multi-Track) ===")
+        typer.echo(f"Total: {report.total_races} races, {report.total_samples} samples")
+        typer.echo(f"Track models trained: {model.track_codes()}")
+
+        typer.echo(f"\n--- Feature Importances (fallback model) ---")
+        for name, imp in report.feature_importances:
+            bar = "#" * min(imp, 50)
+            typer.echo(f"  {name:>30s}: {imp:4d} {bar}")
+
+        from app.services.modeling_v20 import _FALLBACK_KEY
+        for tc, sub in model.track_models.items():
+            label = tc if tc != _FALLBACK_KEY else "fallback"
+            typer.echo(f"\n  [{label}] alpha={sub.market_alpha:.2f}  alpha_map={sub.alpha_map}")
+
+        model.save(out)
+
+        upsert_model_run(
+            db,
+            model_version="v20",
+            train_from=d_from,
+            train_to=d_to,
+            created_at=datetime.now(timezone.utc),
+            logloss=report.cv_mean_logloss,
+            n_races=report.total_races,
+            n_samples=report.total_samples,
+        )
+
+        typer.echo(f"\nModel saved to {out}")
+
+
+# ---------------------------------------------------------------
+# evaluate:exacta
+# ---------------------------------------------------------------
+@app.command("evaluate:exacta")
+def evaluate_exacta(
+    from_date: str = typer.Option(..., "--from", help="Evaluation start date YYYY-MM-DD"),
+    to_date: str = typer.Option(..., "--to", help="Evaluation end date YYYY-MM-DD"),
+    train_days: int = typer.Option(60, "--train-days", help="Training window in days"),
+    val_days: int = typer.Option(7, "--val-days", help="Validation window in days"),
+    test_days: int = typer.Option(7, "--test-days", help="Test window in days"),
+    step_days: int = typer.Option(7, "--step-days", help="Step size in days"),
+    version: str = typer.Option("v18", "--version", help="Model version (v16, v17, or v18)"),
+) -> None:
+    """Walk-forward evaluation with market baseline comparison."""
+    import numpy as np
+
+    from app.db.session import get_db
+    from app.services.racer_stats import get_racer_stats
+    from app.services.walkforward import generate_splits, run_walkforward
+
+    d_from = date.fromisoformat(from_date)
+    d_to = date.fromisoformat(to_date)
+
+    splits = generate_splits(
+        d_from, d_to,
+        train_days=train_days, val_days=val_days,
+        test_days=test_days, step_days=step_days,
+    )
+
+    if not splits:
+        typer.echo("No valid splits generated. Check date range and window sizes.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"\n=== Walk-Forward Evaluation ({version}) ===")
+    typer.echo(f"Period: {from_date} ~ {to_date}")
+    typer.echo(
+        f"Splits: {len(splits)}, Train={train_days}d, Val={val_days}d, "
+        f"Test={test_days}d, Step={step_days}d"
+    )
+
+    if version == "v18":
+        from app.services.modeling_v18 import ExactaModelV18, extract_v18_features, compute_race_context
+        from app.services.training import build_v18_training_data
+
+        def train_model_fn(rows):
+            from lightgbm import LGBMClassifier
+
+            X = np.array([r.features for r in rows])
+            y = np.array([r.label for r in rows])
+            clf = LGBMClassifier(
+                n_estimators=100, max_depth=4, num_leaves=15,
+                min_child_samples=50, reg_alpha=1.0, reg_lambda=1.0,
+                random_state=42, verbose=-1,
+            )
+            clf.fit(X, y)
+            return ExactaModelV18(model=clf)
+
+        def extract_features_fn(db, race, entries, odds_dict):
+            car_nos = [e.car_no for e in entries]
+            race_date = race.race_day.race_date
+            race_ctx = compute_race_context(entries)
+            feats = np.array([
+                extract_v18_features(
+                    e,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                    race_context=race_ctx,
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        build_training_data_fn = build_v18_training_data
+    elif version == "v17":
+        from app.services.modeling_v17 import ExactaModelV17, extract_v17_features
+        from app.services.training import build_v17_training_data
+
+        def train_model_fn(rows):
+            from lightgbm import LGBMClassifier
+
+            X = np.array([r.features for r in rows])
+            y = np.array([r.label for r in rows])
+            clf = LGBMClassifier(
+                n_estimators=100, max_depth=4, num_leaves=15,
+                min_child_samples=50, reg_alpha=1.0, reg_lambda=1.0,
+                random_state=42, verbose=-1,
+            )
+            clf.fit(X, y)
+            return ExactaModelV17(model=clf)
+
+        def extract_features_fn(db, race, entries, odds_dict):
+            car_nos = [e.car_no for e in entries]
+            race_date = race.race_day.race_date
+            feats = np.array([
+                extract_v17_features(
+                    e,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        build_training_data_fn = build_v17_training_data
+    else:
+        from app.services.modeling_v13 import compute_runner_odds_stats
+        from app.services.modeling_v16 import ExactaModelV16, extract_v16_features
+        from app.services.training import build_v16_training_data
+
+        def train_model_fn(rows):
+            from lightgbm import LGBMClassifier
+
+            X = np.array([r.features for r in rows])
+            y = np.array([r.label for r in rows])
+            clf = LGBMClassifier(
+                n_estimators=100, max_depth=4, num_leaves=15,
+                min_child_samples=50, reg_alpha=1.0, reg_lambda=1.0,
+                random_state=42, verbose=-1,
+            )
+            clf.fit(X, y)
+            return ExactaModelV16(model=clf)
+
+        def extract_features_fn(db, race, entries, odds_dict):
+            car_nos = [e.car_no for e in entries]
+            odds_stats = compute_runner_odds_stats(odds_dict, car_nos)
+            race_date = race.race_day.race_date
+            feats = np.array([
+                extract_v16_features(
+                    e, odds_stats,
+                    racer_stats=get_racer_stats(db, e.racer_id, before_date=race_date),
+                )
+                for e in entries
+            ])
+            return car_nos, feats
+
+        build_training_data_fn = build_v16_training_data
+
+    with get_db() as db:
+        report = run_walkforward(
+            db, splits,
+            build_training_data_fn=build_training_data_fn,
+            train_model_fn=train_model_fn,
+            extract_features_fn=extract_features_fn,
+        )
+
+    if not report.splits:
+        typer.echo("\nNo evaluable splits. Insufficient data.")
+        return
+
+    # Display per-split results
+    for sr in report.splits:
+        s = sr.split
+        typer.echo(
+            f"\n--- Split {sr.split_idx}: "
+            f"[train {s.train_from}~{s.train_to}] "
+            f"[val {s.val_from}~{s.val_to}] "
+            f"[test {s.test_from}~{s.test_to}] ---"
+        )
+        typer.echo(
+            f"  Model:    LogLoss={sr.model_logloss:.3f}  "
+            f"Brier={sr.model_brier:.4f}  Top1={sr.model_top1:.1%}  "
+            f"({sr.n_races} races)"
+        )
+        typer.echo(
+            f"  Baseline: LogLoss={sr.baseline_logloss:.3f}  "
+            f"Brier={sr.baseline_brier:.4f}  Top1={sr.baseline_top1:.1%}"
+        )
+        delta_ll = sr.model_logloss - sr.baseline_logloss
+        mark = "+" if delta_ll >= 0 else "-"
+        typer.echo(f"  Delta LogLoss: {delta_ll:+.3f} {'x' if delta_ll >= 0 else 'v'}")
+
+    # Aggregated summary
+    m_ll, m_ll_std = report.model_logloss
+    b_ll, b_ll_std = report.baseline_logloss
+    m_br, m_br_std = report.model_brier
+    b_br, b_br_std = report.baseline_brier
+    m_t1, m_t1_std = report.model_top1
+    b_t1, b_t1_std = report.baseline_top1
+
+    typer.echo(f"\n--- Summary ({len(report.splits)} splits) ---")
+    typer.echo(f"{'':>14s}  {'Model':>16s}  {'Baseline':>16s}  {'Delta':>10s}")
+    typer.echo(
+        f"{'LogLoss':>14s}  {m_ll:.3f}+/-{m_ll_std:.3f}  "
+        f"{b_ll:.3f}+/-{b_ll_std:.3f}  {m_ll - b_ll:+.3f} "
+        f"{'v' if m_ll < b_ll else 'x'}"
+    )
+    typer.echo(
+        f"{'Brier':>14s}  {m_br:.4f}+/-{m_br_std:.4f}  "
+        f"{b_br:.4f}+/-{b_br_std:.4f}  {m_br - b_br:+.4f} "
+        f"{'v' if m_br < b_br else 'x'}"
+    )
+    typer.echo(
+        f"{'Top-1':>14s}  {m_t1:.1%}+/-{m_t1_std:.1%}  "
+        f"{b_t1:.1%}+/-{b_t1_std:.1%}  {m_t1 - b_t1:+.1%} "
+        f"{'v' if m_t1 > b_t1 else 'x'}"
+    )
+
+
+# ---------------------------------------------------------------
+# backfill:stats-json
+# ---------------------------------------------------------------
+@app.command("backfill:stats-json")
+def backfill_stats_json_cmd() -> None:
+    """Backfill stats_json from disk program snapshots (no API calls)."""
+    from scripts.backfill_stats_json import backfill_stats_json
+
+    backfill_stats_json()
 
 
 # ---------------------------------------------------------------

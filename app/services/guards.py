@@ -33,7 +33,7 @@ def guard_odds_race(
     *,
     race_day_id: int,
     race_no: int,
-    min_entries: int = 7,
+    min_entries: int = 2,
 ) -> OddsGuardResult:
     race = db.scalar(
         select(Race).where(Race.race_day_id == race_day_id, Race.race_no == race_no)
@@ -56,7 +56,7 @@ def guard_predict_race(
     db: Session,
     *,
     race_id: int,
-    min_entries: int = 7,
+    min_entries: int = 2,
 ) -> PredictGuardResult:
     entries_count = db.scalar(
         select(func.count(RaceEntry.race_entry_id)).where(RaceEntry.race_id == race_id)
@@ -102,7 +102,7 @@ def guard_predict_race(
         )
 
     required_odds = active_entries_count * (active_entries_count - 1)
-    if odds_count < required_odds:
+    if odds_count < required_odds * 0.80:
         return PredictGuardResult(
             ok=False,
             reason="odds_insufficient",

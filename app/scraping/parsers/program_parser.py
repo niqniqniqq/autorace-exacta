@@ -51,6 +51,7 @@ def parse_program(api_response: dict[str, Any], race_no: int) -> list[EntryData]
 
     # Extract 90-day stats for start average
     latest90 = body.get("latest90List") or {}
+    win_list = body.get("winList") or {}
 
     entries: list[EntryData] = []
     for p in player_list:
@@ -59,8 +60,15 @@ def parse_program(api_response: dict[str, Any], race_no: int) -> list[EntryData]
 
             # Get start average from latest90List (keyed by player code)
             start_avg = None
+            latest90_entry: dict = {}
             if player_code and player_code in latest90:
-                start_avg = _safe_float(latest90[player_code].get("stAve"))
+                latest90_entry = latest90[player_code]
+                start_avg = _safe_float(latest90_entry.get("stAve"))
+
+            # Get career stats from winList (keyed by player code)
+            win_entry: dict = {}
+            if player_code and player_code in win_list:
+                win_entry = win_list[player_code]
 
             entry = EntryData(
                 car_no=int(p.get("carNo", 0)),
@@ -79,6 +87,16 @@ def parse_program(api_response: dict[str, Any], race_no: int) -> list[EntryData]
                     "bike_class": p.get("bikeClass"),
                     "graduation_code": p.get("graduationCode"),
                     "place_name": p.get("placeName"),
+                    # latest90List data
+                    "good_track_trial_avg": _safe_float(latest90_entry.get("goodTrackTraialAve")),
+                    "good_track_race_avg": _safe_float(latest90_entry.get("goodTrackRaceAve")),
+                    "run_count_90d": _safe_int(latest90_entry.get("runCount")),
+                    "win_count_90d": _safe_int(latest90_entry.get("winCount")),
+                    # winList data
+                    "career_win_rate": _safe_float(win_entry.get("rate1")),
+                    "career_place_rate": _safe_float(win_entry.get("rate2")),
+                    "career_trio_rate": _safe_float(win_entry.get("rate3")),
+                    "career_total_wins": _safe_int(win_entry.get("totalWinCount")),
                 },
             )
             entries.append(entry)
